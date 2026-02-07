@@ -1,0 +1,27 @@
+{
+  "expo": {
+    "name": "GuitarPlayAlong",
+    "slug": "guitar-play-along",
+    "version": "1.0.0",
+    "orientation": "landscape",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "splash": {
+      "backgroundColor": "#1a1a2e"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.guitarplayalong.app"
+    },
+    "android": {
+      "package": "com.guitarplayalong.app"
+    },
+    "web": {
+      "bundler": "metro"
+    },
+    "plugins": [
+      "expo-av",
+      "expo-file-system"
+    ]
+  }
+}
