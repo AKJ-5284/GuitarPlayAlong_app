@@ -13,6 +13,7 @@ import { useNavigation, useRoute, RouteProp } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { Song, Note } from '../types/song';
 import { RootStackParamList } from '../../App';
+import { initAudio, playNote, playLegato, playSlide, stopAllSounds } from '../audio/guitarAudio';
 
 type PlayalongRouteProp = RouteProp<RootStackParamList, 'Playalong'>;
 type NavigationProp = NativeStackNavigationProp<RootStackParamList>;
@@ -62,6 +63,17 @@ interface LinkedNoteChain {
   y: number;
   startBeat: number;       // First note's beat
   totalDuration: number;   // Combined duration from first note start to last note end
+}
+
+// Audio note for triggering sounds
+interface AudioNote {
+  id: string;
+  beat: number;
+  stringNumber: number;
+  fret: number;
+  len: number;
+  technique: 'h' | 'p' | '/' | null; // technique that leads TO this note
+  nextFret?: number; // for slides, the target fret
 }
 
 // Animated Bar Line Component
@@ -177,6 +189,8 @@ export default function PlayalongScreen(): React.JSX.Element {
   const { song } = route.params;
   
   const activeNoteIndex = useSharedValue(0);
+  const triggeredNotesRef = useRef<Set<string>>(new Set());
+  const triggerNotesAtBeatRef = useRef<((beat: number) => void) | null>(null);
   
   const [isPlaying, setIsPlaying] = useState(false);
   const [hasEnded, setHasEnded] = useState(false);
@@ -298,6 +312,26 @@ export default function PlayalongScreen(): React.JSX.Element {
     };
   }, []);
 
+  // Initialize audio on mount
+  useEffect(() => {
+    initAudio();
+    return () => {
+      stopAllSounds();
+    };
+  }, []);
+
+  // Reset triggered notes when playback stops
+  useEffect(() => {
+    if (!isPlaying) {
+      triggeredNotesRef.current.clear();
+    }
+  }, [isPlaying]);
+
+  // Wrapper function that calls through ref (for runOnJS to call from worklet)
+  const triggerAudioAtBeat = useCallback((beat: number) => {
+    triggerNotesAtBeatRef.current?.(beat);
+  }, []);
+
   // Frame callback for smooth animation
   useFrameCallback((frameInfo) => {
     if (!isPlaying || songEndedRef.value) {
@@ -312,6 +346,10 @@ export default function PlayalongScreen(): React.JSX.Element {
 
     // Check if song has ended
     const currentBeatValue = currentTimeMs.value * beatsPerMs;
+    
+    // Trigger audio for notes at current beat (via ref to avoid hook ordering issues)
+    runOnJS(triggerAudioAtBeat)(currentBeatValue);
+    
     if (currentBeatValue >= songDurationBeats && !songEndedRef.value) {
       songEndedRef.value = true;
       runOnJS(handleSongEnd)();
@@ -379,6 +417,93 @@ export default function PlayalongScreen(): React.JSX.Element {
     }
     return notes.sort((a, b) => a.beat - b.beat);
   }, [song]);
+
+  // Prepare audio notes with technique info
+  const audioNotes = useMemo((): AudioNote[] => {
+    const notes: AudioNote[] = [];
+    let noteIndex = 0;
+    
+    for (const track of song.tracks) {
+      const sortedTrackNotes = [...track.notes].sort((a, b) => a.beat - b.beat);
+      
+      for (let i = 0; i < sortedTrackNotes.length; i++) {
+        const note = sortedTrackNotes[i];
+        const prevNote = i > 0 ? sortedTrackNotes[i - 1] : null;
+        
+        // Determine if this note is reached via a technique
+        let technique: 'h' | 'p' | '/' | null = null;
+        if (prevNote && prevNote.linkNext) {
+          technique = prevNote.linkNext;
+        }
+        
+        // For slides, we need the next fret
+        let nextFret: number | undefined;
+        if (note.linkNext === '/' && i + 1 < sortedTrackNotes.length) {
+          nextFret = sortedTrackNotes[i + 1].fret;
+        }
+        
+        notes.push({
+          id: `${track.string}_${note.beat}_${noteIndex}`,
+          beat: note.beat,
+          stringNumber: track.string,
+          fret: note.fret,
+          len: note.len,
+          technique,
+          nextFret,
+        });
+        noteIndex++;
+      }
+    }
+    
+    return notes.sort((a, b) => a.beat - b.beat);
+  }, [song]);
+
+  // Calculate beat duration in ms
+  const msPerBeat = 60000 / song.bpm;
+  
+  // Store playback speed in ref for JS thread access
+  const playbackSpeedRef = useRef(1.0);
+  useEffect(() => {
+    playbackSpeedRef.current = playbackSpeed / 100;
+  }, [playbackSpeed]);
+
+  // Trigger audio for notes that have just been reached
+  const triggerNotesAtBeat = useCallback((currentBeatValue: number) => {
+    try {
+      for (const note of audioNotes) {
+        // Check if we've just passed this note's beat and haven't triggered it yet
+        if (note.beat <= currentBeatValue && !triggeredNotesRef.current.has(note.id)) {
+          // Mark as triggered
+          triggeredNotesRef.current.add(note.id);
+          
+          // Calculate duration in ms (adjusted for playback speed)
+          const speedMultiplier = playbackSpeedRef.current || 1.0;
+          const durationMs = note.len * msPerBeat / speedMultiplier;
+          
+          if (note.technique === null) {
+            // Normal picked note
+            playNote(note.stringNumber, note.fret, durationMs);
+          } else if (note.technique === 'h' || note.technique === 'p') {
+            // Hammer-on or pull-off
+            playLegato(note.stringNumber, note.fret, durationMs, note.technique);
+          }
+          // Note: slides TO are handled by the previous note's slide
+          
+          // If this note starts a slide, play the slide
+          if (note.nextFret !== undefined) {
+            playSlide(note.stringNumber, note.fret, note.nextFret, durationMs);
+          }
+        }
+      }
+    } catch (error) {
+      console.warn('Error triggering audio:', error);
+    }
+  }, [audioNotes, msPerBeat]);
+  
+  // Update the ref whenever the callback changes
+  useEffect(() => {
+    triggerNotesAtBeatRef.current = triggerNotesAtBeat;
+  }, [triggerNotesAtBeat]);
 
   // Ball Y position calculation
   const ballY = useDerivedValue(() => {
