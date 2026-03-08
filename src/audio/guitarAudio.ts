@@ -1,23 +1,12 @@
-import { Audio, AVPlaybackStatus } from 'expo-av';
+import { AudioPlayer, createAudioPlayer, setAudioModeAsync } from 'expo-audio';
+import { Song } from '../types/song';
 
-// Guitar sample asset mapping
+// Guitar sample asset mapping - all samples must be statically required
 // Format: string{s}_fret{ff}_{note}.wav
 // Strings: 1 (high E) to 6 (low E)
-// Frets: 0 (open) to 24
+// Frets: 0 (open) to 22
 
-// Note names for each string starting from open (fret 0)
-const STRING_NOTES: { [key: number]: string[] } = {
-  1: ['E4', 'F4', 'Fs4', 'G4', 'Gs4', 'A4', 'As4', 'B4', 'C5', 'Cs5', 'D5', 'Ds5', 'E5', 'F5', 'Fs5', 'G5', 'Gs5', 'A5', 'As5', 'B5', 'C6', 'Cs6', 'D6', 'Ds6', 'E6'],
-  2: ['B3', 'C4', 'Cs4', 'D4', 'Ds4', 'E4', 'F4', 'Fs4', 'G4', 'Gs4', 'A4', 'As4', 'B4', 'C5', 'Cs5', 'D5', 'Ds5', 'E5', 'F5', 'Fs5', 'G5', 'Gs5', 'A5', 'As5', 'B5'],
-  3: ['G3', 'Gs3', 'A3', 'As3', 'B3', 'C4', 'Cs4', 'D4', 'Ds4', 'E4', 'F4', 'Fs4', 'G4', 'Gs4', 'A4', 'As4', 'B4', 'C5', 'Cs5', 'D5', 'Ds5', 'E5', 'F5', 'Fs5', 'G5'],
-  4: ['D3', 'Ds3', 'E3', 'F3', 'Fs3', 'G3', 'Gs3', 'A3', 'As3', 'B3', 'C4', 'Cs4', 'D4', 'Ds4', 'E4', 'F4', 'Fs4', 'G4', 'Gs4', 'A4', 'As4', 'B4', 'C5', 'Cs5', 'D5'],
-  5: ['A2', 'As2', 'B2', 'C3', 'Cs3', 'D3', 'Ds3', 'E3', 'F3', 'Fs3', 'G3', 'Gs3', 'A3', 'As3', 'B3', 'C4', 'Cs4', 'D4', 'Ds4', 'E4', 'F4', 'Fs4', 'G4', 'Gs4', 'A4'],
-  6: ['E2', 'F2', 'Fs2', 'G2', 'Gs2', 'A2', 'As2', 'B2', 'C3', 'Cs3', 'D3', 'Ds3', 'E3', 'F3', 'Fs3', 'G3', 'Gs3', 'A3', 'As3', 'B3', 'C4', 'Cs4', 'D4', 'Ds4', 'E4'],
-};
-
-// Build the require mapping for all samples
-// Using require() for static asset bundling
-const GUITAR_SAMPLES: { [key: string]: any } = {
+const ALL_SAMPLES: { [key: string]: any } = {
   // String 1 (High E)
   '1_0': require('../../assets/guitar_fret_samples/string1_fret00_E4.wav'),
   '1_1': require('../../assets/guitar_fret_samples/string1_fret01_F4.wav'),
@@ -164,97 +153,102 @@ const GUITAR_SAMPLES: { [key: string]: any } = {
   '6_22': require('../../assets/guitar_fret_samples/string6_fret22_D4.wav'),
 };
 
-// Active sounds per string (for stopping previous notes)
-const activeSounds: { [stringNumber: number]: Audio.Sound | null } = {
-  1: null,
-  2: null,
-  3: null,
-  4: null,
-  5: null,
-  6: null,
-};
+// Preloaded AudioPlayers for the current song (only the needed samples)
+const loadedPlayers: { [key: string]: AudioPlayer } = {};
 
-// Slide animation intervals
-const slideIntervals: { [stringNumber: number]: NodeJS.Timeout | null } = {
-  1: null,
-  2: null,
-  3: null,
-  4: null,
-  5: null,
-  6: null,
-};
-
-// Skip attack offset in milliseconds (for legato techniques)
-const LEGATO_SKIP_MS = 40;
-
-// Initialize audio mode
-export async function initAudio(): Promise<void> {
-  await Audio.setAudioModeAsync({
-    allowsRecordingIOS: false,
-    playsInSilentModeIOS: true,
-    staysActiveInBackground: false,
-    shouldDuckAndroid: true,
-  });
-}
+// Track if audio mode is initialized
+let audioModeInitialized = false;
 
 // Get the sample key for a string and fret
 function getSampleKey(stringNumber: number, fret: number): string {
-  // Clamp fret to valid range (0-22)
   const clampedFret = Math.max(0, Math.min(22, fret));
   return `${stringNumber}_${clampedFret}`;
 }
 
-// Stop any currently playing sound on a string
-export async function stopStringSound(stringNumber: number): Promise<void> {
-  // Clear any slide animation
-  if (slideIntervals[stringNumber]) {
-    clearInterval(slideIntervals[stringNumber]!);
-    slideIntervals[stringNumber] = null;
-  }
+// Initialize audio mode (call once on app start)
+export async function initAudio(): Promise<void> {
+  if (audioModeInitialized) return;
   
-  const activeSound = activeSounds[stringNumber];
-  if (activeSound) {
-    try {
-      await activeSound.stopAsync();
-      await activeSound.unloadAsync();
-    } catch (e) {
-      // Ignore errors on cleanup
-    }
-    activeSounds[stringNumber] = null;
+  try {
+    await setAudioModeAsync({
+      playsInSilentMode: true,
+    });
+    audioModeInitialized = true;
+  } catch (e) {
+    console.warn('Error setting audio mode:', e);
   }
 }
 
-// Play a normal picked note
-export async function playNote(
-  stringNumber: number,
-  fret: number,
-  durationMs: number
-): Promise<void> {
-  const sampleKey = getSampleKey(stringNumber, fret);
-  const sample = GUITAR_SAMPLES[sampleKey];
+// Extract unique note keys from a song
+export function getRequiredSampleKeys(song: Song): string[] {
+  const keys = new Set<string>();
   
-  if (!sample) {
-    console.warn(`No sample found for string ${stringNumber}, fret ${fret}`);
+  for (const track of song.tracks) {
+    for (const note of track.notes) {
+      const key = getSampleKey(track.string, note.fret);
+      keys.add(key);
+    }
+  }
+  
+  return Array.from(keys);
+}
+
+// Preload only the samples needed for a specific song
+export async function preloadSamplesForSong(song: Song): Promise<void> {
+  // First, unload any previously loaded samples
+  unloadAllSamples();
+  
+  const requiredKeys = getRequiredSampleKeys(song);
+  console.log(`Preloading ${requiredKeys.length} samples for song: ${song.name}`);
+  
+  // Create AudioPlayers for each required sample
+  for (const key of requiredKeys) {
+    const sample = ALL_SAMPLES[key];
+    if (sample) {
+      try {
+        const player = createAudioPlayer(sample);
+        loadedPlayers[key] = player;
+      } catch (e) {
+        console.warn(`Failed to load sample ${key}:`, e);
+      }
+    }
+  }
+  
+  console.log(`Preloaded ${Object.keys(loadedPlayers).length} samples`);
+}
+
+// Unload all currently loaded samples
+export function unloadAllSamples(): void {
+  for (const key in loadedPlayers) {
+    try {
+      loadedPlayers[key].release();
+    } catch (e) {
+      // Ignore cleanup errors
+    }
+    delete loadedPlayers[key];
+  }
+}
+
+// Check if samples are loaded
+export function areSamplesLoaded(): boolean {
+  return Object.keys(loadedPlayers).length > 0;
+}
+
+// Play a note - uses preloaded player, seeks to start and plays
+// Note: Let the full sample play without duration cutoff
+export function playNote(stringNumber: number, fret: number): void {
+  const key = getSampleKey(stringNumber, fret);
+  const player = loadedPlayers[key];
+  
+  if (!player) {
+    console.warn(`No preloaded sample for string ${stringNumber}, fret ${fret}`);
     return;
   }
   
-  // Stop any existing sound on this string
-  await stopStringSound(stringNumber);
-  
   try {
-    const { sound } = await Audio.Sound.createAsync(sample, {
-      shouldPlay: true,
-      volume: 1.0,
-    });
-    
-    activeSounds[stringNumber] = sound;
-    
-    // Schedule stop after duration
-    setTimeout(async () => {
-      if (activeSounds[stringNumber] === sound) {
-        await stopStringSound(stringNumber);
-      }
-    }, durationMs);
+    player.seekTo(0);
+    player.volume = 1.0;
+    player.play();
   } catch (e) {
     console.error('Error playing note:', e);
   }
@@ -262,114 +256,82 @@ export async function playNote(
 
 // Play a legato note (hammer-on or pull-off)
 // Skips the pick attack for a smoother transition
-export async function playLegato(
+export function playLegato(
   stringNumber: number,
   fret: number,
-  durationMs: number,
   technique: 'h' | 'p'
-): Promise<void> {
-  const sampleKey = getSampleKey(stringNumber, fret);
-  const sample = GUITAR_SAMPLES[sampleKey];
+): void {
+  const key = getSampleKey(stringNumber, fret);
+  const player = loadedPlayers[key];
   
-  if (!sample) {
-    console.warn(`No sample found for string ${stringNumber}, fret ${fret}`);
+  if (!player) {
+    console.warn(`No preloaded sample for string ${stringNumber}, fret ${fret}`);
     return;
   }
   
-  // Stop any existing sound on this string
-  await stopStringSound(stringNumber);
-  
   try {
-    const { sound } = await Audio.Sound.createAsync(sample, {
-      shouldPlay: false,
-      volume: technique === 'h' ? 0.75 : 0.65, // Pull-offs are typically quieter
-      positionMillis: LEGATO_SKIP_MS, // Skip the pick attack
-    });
-    
-    activeSounds[stringNumber] = sound;
-    await sound.playAsync();
-    
-    // Schedule stop after duration
-    setTimeout(async () => {
-      if (activeSounds[stringNumber] === sound) {
-        await stopStringSound(stringNumber);
-      }
-    }, durationMs);
+    player.seekTo(0.04); // Skip 40ms pick attack
+    player.volume = technique === 'h' ? 0.75 : 0.65;
+    player.play();
   } catch (e) {
     console.error('Error playing legato:', e);
   }
 }
 
 // Play a slide between two frets
-export async function playSlide(
+export function playSlide(
   stringNumber: number,
   startFret: number,
-  endFret: number,
-  durationMs: number
-): Promise<void> {
-  const sampleKey = getSampleKey(stringNumber, startFret);
-  const sample = GUITAR_SAMPLES[sampleKey];
+  endFret: number
+): void {
+  const key = getSampleKey(stringNumber, startFret);
+  const player = loadedPlayers[key];
   
-  if (!sample) {
-    console.warn(`No sample found for string ${stringNumber}, fret ${startFret}`);
+  if (!player) {
+    console.warn(`No preloaded sample for string ${stringNumber}, fret ${startFret}`);
     return;
   }
   
-  // Stop any existing sound on this string
-  await stopStringSound(stringNumber);
-  
   try {
-    const { sound } = await Audio.Sound.createAsync(sample, {
-      shouldPlay: true,
-      volume: 0.85,
-    });
+    player.seekTo(0);
+    player.volume = 0.85;
+    player.play();
     
-    activeSounds[stringNumber] = sound;
-    
-    // Calculate the pitch ratio
+    // Animate the playback rate for slide effect
     const semitones = endFret - startFret;
     const targetRate = Math.pow(2, semitones / 12);
-    
-    // Animate the rate over the duration
     const steps = 20;
-    const stepDuration = durationMs / steps;
+    const stepDuration = 100; // 100ms per step = 2 seconds total
     let currentStep = 0;
     
-    slideIntervals[stringNumber] = setInterval(async () => {
+    const slideInterval = setInterval(() => {
       currentStep++;
       const progress = currentStep / steps;
       const currentRate = 1 + (targetRate - 1) * progress;
       
       try {
-        if (activeSounds[stringNumber] === sound) {
-          await sound.setRateAsync(currentRate, true);
-        }
+        player.setPlaybackRate(currentRate);
       } catch (e) {
         // Ignore rate errors
       }
       
       if (currentStep >= steps) {
-        if (slideIntervals[stringNumber]) {
-          clearInterval(slideIntervals[stringNumber]!);
-          slideIntervals[stringNumber] = null;
-        }
+        clearInterval(slideInterval);
       }
     }, stepDuration);
-    
-    // Schedule stop after duration
-    setTimeout(async () => {
-      if (activeSounds[stringNumber] === sound) {
-        await stopStringSound(stringNumber);
-      }
-    }, durationMs);
   } catch (e) {
     console.error('Error playing slide:', e);
   }
 }
 
 // Stop all sounds (cleanup)
-export async function stopAllSounds(): Promise<void> {
-  for (let s = 1; s <= 6; s++) {
-    await stopStringSound(s);
+export function stopAllSounds(): void {
+  for (const key in loadedPlayers) {
+    try {
+      loadedPlayers[key].pause();
+      loadedPlayers[key].seekTo(0);
+    } catch (e) {
+      // Ignore errors
+    }
   }
 }

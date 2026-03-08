@@ -227,6 +227,45 @@ export const createNewSong = (name: string = 'Untitled Song', bpm: number = 120,
 };
 
 /**
+ * Generates a unique song name by appending (1), (2), etc. if name already exists
+ * @param desiredName The name the user wants
+ * @param excludeSongId Optional song ID to exclude from the check (for editing existing song)
+ */
+export const getUniqueSongName = async (desiredName: string, excludeSongId?: string): Promise<string> => {
+  const songs = await listSongs();
+  const existingNames = new Set(
+    songs
+      .filter(s => s.id !== excludeSongId)
+      .map(s => s.name.toLowerCase())
+  );
+  
+  // If the name doesn't exist, use it as-is
+  if (!existingNames.has(desiredName.toLowerCase())) {
+    return desiredName;
+  }
+  
+  // Find the next available number
+  let counter = 1;
+  let newName = `${desiredName} (${counter})`;
+  while (existingNames.has(newName.toLowerCase())) {
+    counter++;
+    newName = `${desiredName} (${counter})`;
+  }
+  
+  return newName;
+};
+
+/**
+ * Checks if a song name already exists
+ * @param name The name to check
+ * @param excludeSongId Optional song ID to exclude from the check
+ */
+export const doesSongNameExist = async (name: string, excludeSongId?: string): Promise<boolean> => {
+  const songs = await listSongs();
+  return songs.some(s => s.id !== excludeSongId && s.name.toLowerCase() === name.toLowerCase());
+};
+
+/**
  * Duplicates an existing song with a new ID
  */
 export const duplicateSong = async (songId: string): Promise<Song | null> => {

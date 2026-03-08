@@ -7,24 +7,22 @@ import {
   ActivityIndicator, 
   TouchableOpacity,
   Alert,
+  SafeAreaView,
 } from 'react-native';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
-import { BottomTabNavigationProp } from '@react-navigation/bottom-tabs';
-import { CompositeNavigationProp } from '@react-navigation/native';
 import { listSongs, loadSong, deleteSong } from '../storage/songStorage';
 import { SongMetadata } from '../types/song';
-import { RootStackParamList, TabParamList } from '../../App';
+import { RootStackParamList } from '../../App';
+import { preloadSamplesForSong, initAudio } from '../audio/guitarAudio';
 
-type NavigationProp = CompositeNavigationProp<
-  BottomTabNavigationProp<TabParamList, 'Songs'>,
-  NativeStackNavigationProp<RootStackParamList>
->;
+type NavigationProp = NativeStackNavigationProp<RootStackParamList, 'Songs'>;
 
 export default function SongsScreen(): React.JSX.Element {
   const navigation = useNavigation<NavigationProp>();
   const [songs, setSongs] = useState<SongMetadata[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadingSong, setLoadingSong] = useState(false);
   const [selectedSongs, setSelectedSongs] = useState<Set<string>>(new Set());
   const [isSelectionMode, setIsSelectionMode] = useState(false);
 
@@ -68,9 +66,23 @@ export default function SongsScreen(): React.JSX.Element {
         return newSet;
       });
     } else {
-      const song = await loadSong(songId);
-      if (song) {
-        navigation.navigate('Playalong', { song });
+      // Show loading modal while preloading samples
+      setLoadingSong(true);
+      try {
+        // Initialize audio mode
+        await initAudio();
+        
+        const song = await loadSong(songId);
+        if (song) {
+          // Preload only the samples needed for this song
+          await preloadSamplesForSong(song);
+          navigation.navigate('Playalong', { song });
+        }
+      } catch (e) {
+        console.error('Error loading song:', e);
+        Alert.alert('Error', 'Failed to load song samples');
+      } finally {
+        setLoadingSong(false);
       }
     }
   }, [isSelectionMode, navigation]);
@@ -168,58 +180,73 @@ export default function SongsScreen(): React.JSX.Element {
   }
 
   return (
-    <View style={styles.container}>
-      {/* Selection mode header */}
-      {isSelectionMode ? (
-        <View style={styles.selectionHeader}>
-          <TouchableOpacity onPress={handleCancelSelection} style={styles.cancelButton}>
-            <Text style={styles.cancelText}>Cancel</Text>
-          </TouchableOpacity>
-          <Text style={styles.selectionCount}>
-            {selectedSongs.size} selected
-          </Text>
-          <View style={styles.selectionActions}>
-            {selectedSongs.size === 1 && (
-              <TouchableOpacity onPress={handleEditSelected} style={styles.actionButton}>
-                <Text style={styles.editIcon}>✎</Text>
+    <SafeAreaView style={styles.safeArea}>
+      <View style={styles.container}>
+        {/* Loading Overlay for sample preloading (using View instead of Modal to avoid iOS crash) */}
+        {loadingSong && (
+          <View style={styles.loadingOverlay}>
+            <View style={styles.loadingContent}>
+              <ActivityIndicator size="large" color="#e94560" />
+              <Text style={styles.loadingText}>Loading samples...</Text>
+            </View>
+          </View>
+        )}
+
+        {/* Selection mode header */}
+        {isSelectionMode ? (
+          <View style={styles.selectionHeader}>
+            <TouchableOpacity onPress={handleCancelSelection} style={styles.cancelButton}>
+              <Text style={styles.cancelText}>Cancel</Text>
+            </TouchableOpacity>
+            <Text style={styles.selectionCount}>
+              {selectedSongs.size} selected
+            </Text>
+            <View style={styles.selectionActions}>
+              {selectedSongs.size === 1 && (
+                <TouchableOpacity onPress={handleEditSelected} style={styles.editButton}>
+                  <Text style={styles.editButtonText}>Edit</Text>
+                </TouchableOpacity>
+              )}
+              <TouchableOpacity onPress={handleDeleteSelected} style={styles.deleteButton}>
+                <Text style={styles.deleteButtonText}>Delete</Text>
               </TouchableOpacity>
-            )}
-            <TouchableOpacity onPress={handleDeleteSelected} style={styles.actionButton}>
-              <Text style={styles.deleteIcon}>🗑</Text>
+            </View>
+          </View>
+        ) : (
+          <View style={styles.header}>
+            <Text style={styles.title}>My Songs</Text>
+            <TouchableOpacity onPress={handleCreateNewSong} style={styles.addButton}>
+              <Text style={styles.addIcon}>+</Text>
             </TouchableOpacity>
           </View>
-        </View>
-      ) : (
-        <View style={styles.header}>
-          <Text style={styles.title}>My Songs</Text>
-          <TouchableOpacity onPress={handleCreateNewSong} style={styles.addButton}>
-            <Text style={styles.addIcon}>+</Text>
-          </TouchableOpacity>
-        </View>
-      )}
-      {songs.length === 0 ? (
-        <View style={styles.emptyContainer}>
-          <Text style={styles.emptyText}>No songs yet</Text>
-          <Text style={styles.emptySubtext}>Create your first song in the Editor tab</Text>
-        </View>
-      ) : (
-        <FlatList
-          data={songs}
-          keyExtractor={(item) => item.id}
-          renderItem={renderSongItem}
-          style={styles.list}
-          contentContainerStyle={styles.listContent}
-        />
-      )}
-    </View>
+        )}
+        {songs.length === 0 ? (
+          <View style={styles.emptyContainer}>
+            <Text style={styles.emptyText}>No songs yet</Text>
+            <Text style={styles.emptySubtext}>Tap + to create your first song</Text>
+          </View>
+        ) : (
+          <FlatList
+            data={songs}
+            keyExtractor={(item) => item.id}
+            renderItem={renderSongItem}
+            style={styles.list}
+            contentContainerStyle={styles.listContent}
+          />
+        )}
+      </View>
+    </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
+  safeArea: {
+    flex: 1,
+    backgroundColor: '#1a1a2e',
+  },
   container: {
     flex: 1,
     backgroundColor: '#1a1a2e',
-    paddingTop: 20,
   },
   loadingContainer: {
     flex: 1,
@@ -237,12 +264,13 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
     paddingHorizontal: 20,
-    marginBottom: 16,
+    paddingTop: 8,
+    paddingBottom: 12,
   },
   addButton: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
     backgroundColor: '#e94560',
     alignItems: 'center',
     justifyContent: 'center',
@@ -258,6 +286,7 @@ const styles = StyleSheet.create({
   },
   listContent: {
     paddingHorizontal: 20,
+    paddingBottom: 20,
   },
   songItem: {
     backgroundColor: '#16213e',
@@ -268,6 +297,7 @@ const styles = StyleSheet.create({
     borderLeftColor: '#e94560',
     flexDirection: 'row',
     alignItems: 'center',
+    minHeight: 56,
   },
   songInfo: {
     flex: 1,
@@ -285,21 +315,23 @@ const styles = StyleSheet.create({
   playIcon: {
     fontSize: 18,
     color: '#e94560',
-    marginLeft: 12,
+    marginLeft: 14,
   },
   emptyContainer: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
+    paddingHorizontal: 40,
   },
   emptyText: {
     fontSize: 18,
     color: '#fff',
-    marginBottom: 8,
+    marginBottom: 10,
   },
   emptySubtext: {
-    fontSize: 12,
+    fontSize: 13,
     color: '#888',
+    textAlign: 'center',
   },
   // Selection mode styles
   selectionHeader: {
@@ -327,20 +359,29 @@ const styles = StyleSheet.create({
   selectionActions: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
+    gap: 10,
   },
-  actionButton: {
-    padding: 8,
+  editButton: {
+    paddingVertical: 8,
+    paddingHorizontal: 14,
     borderRadius: 8,
-    backgroundColor: '#16213e',
+    backgroundColor: '#4a90d9',
   },
-  editIcon: {
-    fontSize: 20,
-    color: '#4a90d9',
+  editButtonText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#fff',
   },
-  deleteIcon: {
-    fontSize: 20,
-    color: '#e94560',
+  deleteButton: {
+    paddingVertical: 8,
+    paddingHorizontal: 14,
+    borderRadius: 8,
+    backgroundColor: '#e94560',
+  },
+  deleteButtonText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#fff',
   },
   songItemSelected: {
     backgroundColor: '#1e3a5f',
@@ -364,5 +405,24 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 14,
     fontWeight: 'bold',
+  },
+  loadingOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0, 0, 0, 0.7)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 1000,
+  },
+  loadingContent: {
+    backgroundColor: '#16213e',
+    padding: 30,
+    borderRadius: 16,
+    alignItems: 'center',
+    gap: 16,
+  },
+  loadingText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '500',
   },
 });

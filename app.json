@@ -20,8 +20,8 @@
       "bundler": "metro"
     },
     "plugins": [
-      "expo-av",
-      "expo-file-system"
+      "expo-file-system",
+      "expo-audio"
     ]
   }
 }

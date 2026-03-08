@@ -13,7 +13,7 @@ import { useNavigation, useRoute, RouteProp } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { Song, Note } from '../types/song';
 import { RootStackParamList } from '../../App';
-import { initAudio, playNote, playLegato, playSlide, stopAllSounds } from '../audio/guitarAudio';
+import { initAudio, playNote, playLegato, playSlide, stopAllSounds, unloadAllSamples } from '../audio/guitarAudio';
 
 type PlayalongRouteProp = RouteProp<RootStackParamList, 'Playalong'>;
 type NavigationProp = NativeStackNavigationProp<RootStackParamList>;
@@ -191,6 +191,7 @@ export default function PlayalongScreen(): React.JSX.Element {
   const activeNoteIndex = useSharedValue(0);
   const triggeredNotesRef = useRef<Set<string>>(new Set());
   const triggerNotesAtBeatRef = useRef<((beat: number) => void) | null>(null);
+  const isPlayingRef = useRef(false); // Sync ref for JS callbacks to check
   
   const [isPlaying, setIsPlaying] = useState(false);
   const [hasEnded, setHasEnded] = useState(false);
@@ -317,13 +318,16 @@ export default function PlayalongScreen(): React.JSX.Element {
     initAudio();
     return () => {
       stopAllSounds();
+      unloadAllSamples();
     };
   }, []);
 
-  // Reset triggered notes when playback stops
+  // Keep isPlayingRef in sync with isPlaying state (for JS callbacks to check)
   useEffect(() => {
+    isPlayingRef.current = isPlaying;
+    // Stop any playing sounds when pausing (but don't clear triggered set to avoid race condition)
     if (!isPlaying) {
-      triggeredNotesRef.current.clear();
+      stopAllSounds();
     }
   }, [isPlaying]);
 
@@ -458,9 +462,6 @@ export default function PlayalongScreen(): React.JSX.Element {
     return notes.sort((a, b) => a.beat - b.beat);
   }, [song]);
 
-  // Calculate beat duration in ms
-  const msPerBeat = 60000 / song.bpm;
-  
   // Store playback speed in ref for JS thread access
   const playbackSpeedRef = useRef(1.0);
   useEffect(() => {
@@ -469,6 +470,9 @@ export default function PlayalongScreen(): React.JSX.Element {
 
   // Trigger audio for notes that have just been reached
   const triggerNotesAtBeat = useCallback((currentBeatValue: number) => {
+    // Don't trigger if not playing (prevents race condition when pausing)
+    if (!isPlayingRef.current) return;
+    
     try {
       for (const note of audioNotes) {
         // Check if we've just passed this note's beat and haven't triggered it yet
@@ -476,29 +480,25 @@ export default function PlayalongScreen(): React.JSX.Element {
           // Mark as triggered
           triggeredNotesRef.current.add(note.id);
           
-          // Calculate duration in ms (adjusted for playback speed)
-          const speedMultiplier = playbackSpeedRef.current || 1.0;
-          const durationMs = note.len * msPerBeat / speedMultiplier;
-          
           if (note.technique === null) {
             // Normal picked note
-            playNote(note.stringNumber, note.fret, durationMs);
+            playNote(note.stringNumber, note.fret);
           } else if (note.technique === 'h' || note.technique === 'p') {
             // Hammer-on or pull-off
-            playLegato(note.stringNumber, note.fret, durationMs, note.technique);
+            playLegato(note.stringNumber, note.fret, note.technique);
           }
           // Note: slides TO are handled by the previous note's slide
           
           // If this note starts a slide, play the slide
           if (note.nextFret !== undefined) {
-            playSlide(note.stringNumber, note.fret, note.nextFret, durationMs);
+            playSlide(note.stringNumber, note.fret, note.nextFret);
           }
         }
       }
     } catch (error) {
       console.warn('Error triggering audio:', error);
     }
-  }, [audioNotes, msPerBeat]);
+  }, [audioNotes]);
   
   // Update the ref whenever the callback changes
   useEffect(() => {

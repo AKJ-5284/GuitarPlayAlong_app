@@ -13,7 +13,8 @@ import {
   Keyboard,
   Alert,
 } from 'react-native';
-import { useRoute, RouteProp } from '@react-navigation/native';
+import { useRoute, useNavigation, RouteProp } from '@react-navigation/native';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { Canvas, Line, vec, RoundedRect } from '@shopify/react-native-skia';
 import { Gesture, GestureDetector, GestureHandlerRootView } from 'react-native-gesture-handler';
 import Animated, {
@@ -32,10 +33,12 @@ import {
   snapToGrid,
   generateSongId,
   GRID_SNAP,
+  getUniqueSongName,
 } from '../storage/songStorage';
-import { TabParamList } from '../../App';
+import { RootStackParamList } from '../../App';
 
-type EditorRouteProp = RouteProp<TabParamList, 'Editor'>;
+type EditorRouteProp = RouteProp<RootStackParamList, 'Editor'>;
+type NavigationProp = NativeStackNavigationProp<RootStackParamList>;
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
@@ -143,6 +146,63 @@ function NoteEditModal({ visible, note, onClose, onUpdate, onDelete }: NoteEditM
             <Text style={styles.deleteButtonText}>Delete</Text>
           </TouchableOpacity>
           <TouchableOpacity style={styles.saveModalButton} onPress={() => { onUpdate(editedNote); onClose(); }}>
+            <Text style={styles.saveButtonText}>Save</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </View>
+  );
+}
+
+// Name input modal for saving songs
+interface NameInputModalProps {
+  visible: boolean;
+  initialName: string;
+  title: string;
+  onCancel: () => void;
+  onSave: (name: string) => void;
+}
+
+function NameInputModal({ visible, initialName, title, onCancel, onSave }: NameInputModalProps) {
+  const [name, setName] = useState(initialName);
+  
+  React.useEffect(() => {
+    if (visible) setName(initialName);
+  }, [visible, initialName]);
+
+  if (!visible) return null;
+
+  const handleSave = () => {
+    const trimmedName = name.trim();
+    if (trimmedName.length > 0) {
+      onSave(trimmedName);
+    }
+  };
+
+  return (
+    <View style={styles.modalOverlay}>
+      <Pressable style={StyleSheet.absoluteFill} onPress={onCancel} />
+      <View style={styles.modalContent}>
+        <Text style={styles.modalTitle}>{title}</Text>
+        
+        <TextInput
+          style={styles.nameInput}
+          value={name}
+          onChangeText={setName}
+          autoFocus
+          selectTextOnFocus
+          maxLength={50}
+          placeholder="Enter song name"
+          placeholderTextColor="#666"
+          onSubmitEditing={handleSave}
+          returnKeyType="done"
+        />
+        
+        <View style={styles.actionButtons}>
+          <TouchableOpacity style={styles.cancelModalButton} onPress={onCancel}>
+            <Text style={styles.cancelButtonText}>Cancel</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.saveModalButton} onPress={handleSave}>
             <Text style={styles.saveButtonText}>Save</Text>
           </TouchableOpacity>
         </View>
@@ -259,24 +319,44 @@ function DraggableNote({ note, x, y, width, scrollOffset, onTap, onDragEnd }: Dr
 }
 
 export default function EditorScreen(): React.JSX.Element {
+  const navigation = useNavigation<NavigationProp>();
   const route = useRoute<EditorRouteProp>();
   const passedSong = route.params?.song;
   
+  // Determine if this is a new song or editing existing
+  const isNewSong = !passedSong;
+  
   const [song, setSong] = useState<Song>(() => 
     passedSong || createNewSong('New Song', 120, DEFAULT_BEATS_PER_BAR)
+  );
+  const [originalSong, setOriginalSong] = useState<Song>(() => 
+    passedSong ? { ...passedSong } : createNewSong('New Song', 120, DEFAULT_BEATS_PER_BAR)
   );
   const [selectedNote, setSelectedNote] = useState<Note | null>(null);
   const [modalVisible, setModalVisible] = useState(false);
   const [scrollOffset, setScrollOffset] = useState(0);
   const [isDragging, setIsDragging] = useState(false);
   
+  // Name input modal state
+  const [nameModalVisible, setNameModalVisible] = useState(false);
+  const [saveMode, setSaveMode] = useState<'new' | 'overwrite'>('new');
+  const [pendingBackNavigation, setPendingBackNavigation] = useState(false);
+  
+  // Track unsaved changes by comparing with original
+  const hasUnsavedChanges = useMemo(() => {
+    return JSON.stringify(song) !== JSON.stringify(originalSong);
+  }, [song, originalSong]);
+  
   // Update song when navigated with a different song or reset to blank
   useEffect(() => {
     if (passedSong) {
       setSong(passedSong);
+      setOriginalSong({ ...passedSong });
     } else if (passedSong === undefined && route.params !== undefined) {
       // Explicitly navigated with undefined song = create new blank song
-      setSong(createNewSong('New Song', 120, DEFAULT_BEATS_PER_BAR));
+      const newSong = createNewSong('New Song', 120, DEFAULT_BEATS_PER_BAR);
+      setSong(newSong);
+      setOriginalSong({ ...newSong });
     }
   }, [passedSong, route.params]);
   
@@ -510,50 +590,163 @@ export default function EditorScreen(): React.JSX.Element {
     return bars;
   }, [scrollOffset, beatsPerBar, totalBeats]);
 
-  // Save as new song (create new ID)
-  const handleSaveAsNew = useCallback(() => {
-    const newSong: Song = {
-      ...song,
-      id: generateSongId(),
-      lastModified: Date.now(),
-    };
-    saveSong(newSong);
-    setSong(newSong); // Update current song to the new one
-    showToast('New song created!');
-  }, [song, showToast]);
+  // Complete the save with the given name
+  const completeSave = useCallback(async (finalName: string, mode: 'new' | 'overwrite') => {
+    // Get unique name to avoid duplicates
+    const excludeId = mode === 'overwrite' ? song.id : undefined;
+    const uniqueName = await getUniqueSongName(finalName, excludeId);
+    
+    if (mode === 'new') {
+      // Create new song with new ID
+      const newSong: Song = {
+        ...song,
+        id: generateSongId(),
+        name: uniqueName,
+        lastModified: Date.now(),
+      };
+      saveSong(newSong);
+      setSong(newSong);
+      setOriginalSong({ ...newSong });
+      showToast('Song created!');
+    } else {
+      // Overwrite existing song
+      const updatedSong: Song = {
+        ...song,
+        name: uniqueName,
+        lastModified: Date.now(),
+      };
+      saveSong(updatedSong);
+      setSong(updatedSong);
+      setOriginalSong({ ...updatedSong });
+      showToast('Song saved!');
+    }
+    
+    // If we were pending back navigation, go back now
+    if (pendingBackNavigation) {
+      setPendingBackNavigation(false);
+      navigation.goBack();
+    }
+  }, [song, showToast, pendingBackNavigation, navigation]);
+
+  // Handle name modal save
+  const handleNameModalSave = useCallback((name: string) => {
+    setNameModalVisible(false);
+    completeSave(name, saveMode);
+  }, [completeSave, saveMode]);
   
-  // Save overwriting existing song
-  const handleSaveOverwrite = useCallback(() => {
-    saveSong(song);
-    showToast('Song saved successfully!');
-  }, [song, showToast]);
-  
-  // Show save dialog
+  // Handle name modal cancel
+  const handleNameModalCancel = useCallback(() => {
+    setNameModalVisible(false);
+    setPendingBackNavigation(false);
+  }, []);
+
+  // Show save dialog - different flow for new vs existing songs
   const handleSaveSong = useCallback(() => {
+    if (isNewSong) {
+      // New song: just show name modal and save
+      setSaveMode('new');
+      setNameModalVisible(true);
+    } else {
+      // Editing existing song: ask overwrite or create new
+      Alert.alert(
+        'Save Song',
+        'How would you like to save?',
+        [
+          {
+            text: 'Cancel',
+            style: 'cancel',
+          },
+          {
+            text: 'Create Copy',
+            onPress: () => {
+              setSaveMode('new');
+              setNameModalVisible(true);
+            },
+          },
+          {
+            text: 'Overwrite',
+            style: 'destructive',
+            onPress: () => {
+              setSaveMode('overwrite');
+              setNameModalVisible(true);
+            },
+          },
+        ]
+      );
+    }
+  }, [isNewSong]);
+
+  // Handle back button with unsaved changes warning
+  const handleBackPress = useCallback(() => {
+    if (!hasUnsavedChanges) {
+      navigation.goBack();
+      return;
+    }
+    
+    // Show unsaved changes warning
     Alert.alert(
-      'Save Song',
-      'How would you like to save this song?',
+      'Unsaved Changes',
+      'You have unsaved changes. What would you like to do?',
       [
+        {
+          text: 'Discard',
+          style: 'destructive',
+          onPress: () => navigation.goBack(),
+        },
         {
           text: 'Cancel',
           style: 'cancel',
         },
         {
-          text: 'Create New',
-          onPress: handleSaveAsNew,
-        },
-        {
-          text: 'Overwrite',
-          onPress: handleSaveOverwrite,
-          style: 'destructive',
+          text: 'Save',
+          onPress: () => {
+            setPendingBackNavigation(true);
+            if (isNewSong) {
+              // New song: show name modal
+              setSaveMode('new');
+              setNameModalVisible(true);
+            } else {
+              // Existing song: ask overwrite or create new
+              Alert.alert(
+                'Save Song',
+                'How would you like to save?',
+                [
+                  {
+                    text: 'Cancel',
+                    style: 'cancel',
+                    onPress: () => setPendingBackNavigation(false),
+                  },
+                  {
+                    text: 'Create Copy',
+                    onPress: () => {
+                      setSaveMode('new');
+                      setNameModalVisible(true);
+                    },
+                  },
+                  {
+                    text: 'Overwrite',
+                    onPress: () => {
+                      setSaveMode('overwrite');
+                      setNameModalVisible(true);
+                    },
+                  },
+                ]
+              );
+            }
+          },
         },
       ]
     );
-  }, [handleSaveAsNew, handleSaveOverwrite]);
+  }, [hasUnsavedChanges, navigation, isNewSong]);
 
   return (
     <GestureHandlerRootView style={styles.container}>
       <View style={styles.topBar}>
+        {/* Back Button */}
+        <TouchableOpacity onPress={handleBackPress} style={styles.backButton}>
+          <Text style={styles.backButtonText}>← Back</Text>
+        </TouchableOpacity>
+        
         {/* Editable Song Name */}
         {isEditingName ? (
           <TextInput
@@ -778,6 +971,15 @@ export default function EditorScreen(): React.JSX.Element {
           </View>
         </View>
       )}
+      
+      {/* Name Input Modal */}
+      <NameInputModal
+        visible={nameModalVisible}
+        initialName={song.name}
+        title={isNewSong ? "Name Your Song" : (saveMode === 'new' ? "Name Your Copy" : "Rename Song")}
+        onCancel={handleNameModalCancel}
+        onSave={handleNameModalSave}
+      />
     </GestureHandlerRootView>
   );
 }
@@ -793,6 +995,15 @@ const styles = StyleSheet.create({
     backgroundColor: '#16213e',
     borderBottomWidth: 1,
     borderBottomColor: '#0f3460',
+  },
+  backButton: {
+    paddingVertical: 8,
+    paddingRight: 12,
+  },
+  backButtonText: {
+    color: '#e94560',
+    fontSize: 16,
+    fontWeight: '600',
   },
   songName: { color: '#fff', fontSize: 18, fontWeight: 'bold' },
   songNameInput: {
@@ -920,6 +1131,19 @@ const styles = StyleSheet.create({
   saveButton: { paddingVertical: 8, paddingHorizontal: 16, backgroundColor: '#2ecc71', borderRadius: 8 },
   saveModalButton: { paddingVertical: 12, paddingHorizontal: 24, backgroundColor: '#2ecc71', borderRadius: 8 },
   saveButtonText: { color: '#fff', fontSize: 16, fontWeight: '600' },
+  // Name input modal styles
+  nameInput: { 
+    backgroundColor: '#1a1a2e', 
+    borderWidth: 1, 
+    borderColor: '#444', 
+    borderRadius: 8, 
+    padding: 12, 
+    fontSize: 16, 
+    color: '#fff', 
+    marginBottom: 20 
+  },
+  cancelModalButton: { paddingVertical: 12, paddingHorizontal: 24, backgroundColor: '#666', borderRadius: 8 },
+  cancelButtonText: { color: '#fff', fontSize: 16, fontWeight: '600' },
   // Toast styles
   toastContainer: {
     position: 'absolute',
