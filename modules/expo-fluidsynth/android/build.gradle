@@ -1,0 +1,32 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'expo.modules.fluidsynth'
+version = '0.7.9'
+
+android {
+  namespace "expo.modules.fluidsynth"
+  defaultConfig {
+    versionCode 1
+    versionName "0.7.9"
+  }
+  lintOptions {
+    abortOnError false
+  }
+  buildFeatures {
+    prefab true
+  }
+}
+
+dependencies {
+  // Pre-compiled FluidSynth library for Android (Maven Central - no JitPack needed)
+  implementation 'net.volcanomobile.fluidsynth-android:fluidsynth-android:2.4.6'
+  
+  // JNA for calling FluidSynth C functions from Kotlin
+  implementation 'net.java.dev.jna:jna:5.13.0@aar'
+  
+  // Coroutines for precise timing in audio playback
+  implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
+}

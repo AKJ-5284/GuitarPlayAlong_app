@@ -21,7 +21,8 @@
     },
     "plugins": [
       "expo-file-system",
-      "expo-audio"
+      "expo-audio",
+      "expo-asset"
     ]
   }
 }

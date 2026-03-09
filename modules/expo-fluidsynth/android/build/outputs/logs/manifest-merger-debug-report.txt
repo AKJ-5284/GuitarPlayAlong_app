@@ -1,0 +1,14 @@
+-- Merging decision tree log ---
+manifest
+ADDED from /Users/yashmalve/Documents/Documents2/GuitarPlayAlong2/modules/expo-fluidsynth/android/src/main/AndroidManifest.xml:1:1-2:12
+INJECTED from /Users/yashmalve/Documents/Documents2/GuitarPlayAlong2/modules/expo-fluidsynth/android/src/main/AndroidManifest.xml:1:1-2:12
+	package
+		INJECTED from /Users/yashmalve/Documents/Documents2/GuitarPlayAlong2/modules/expo-fluidsynth/android/src/main/AndroidManifest.xml
+uses-sdk
+INJECTED from /Users/yashmalve/Documents/Documents2/GuitarPlayAlong2/modules/expo-fluidsynth/android/src/main/AndroidManifest.xml reason: use-sdk injection requested
+INJECTED from /Users/yashmalve/Documents/Documents2/GuitarPlayAlong2/modules/expo-fluidsynth/android/src/main/AndroidManifest.xml
+INJECTED from /Users/yashmalve/Documents/Documents2/GuitarPlayAlong2/modules/expo-fluidsynth/android/src/main/AndroidManifest.xml
+	android:targetSdkVersion
+		INJECTED from /Users/yashmalve/Documents/Documents2/GuitarPlayAlong2/modules/expo-fluidsynth/android/src/main/AndroidManifest.xml
+	android:minSdkVersion
+		INJECTED from /Users/yashmalve/Documents/Documents2/GuitarPlayAlong2/modules/expo-fluidsynth/android/src/main/AndroidManifest.xml
