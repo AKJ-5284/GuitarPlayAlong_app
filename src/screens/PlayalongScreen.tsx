@@ -13,12 +13,26 @@ import { useNavigation, useRoute, RouteProp } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { Song, Note } from '../types/song';
 import { RootStackParamList } from '../../App';
-import { initAudio, playNote, playLegato, playSlide, stopAllSounds, unloadAllSamples } from '../audio/guitarAudio';
+import { 
+  initAudio, 
+  playNote, 
+  playLegato, 
+  playSlide, 
+  stopAllSounds, 
+  unloadAllSamples,
+  startPitchDetection,
+  stopPitchDetection,
+  addPitchDetectionListener,
+} from '../audio/guitarAudio';
 
 type PlayalongRouteProp = RouteProp<RootStackParamList, 'Playalong'>;
 type NavigationProp = NativeStackNavigationProp<RootStackParamList>;
 
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
+
+// Pitch detection constants
+const PITCH_MATCH_TOLERANCE = 1; // Allow +/- 1 semitone for a "hit"
+const HIT_WINDOW_BEATS = 0.5; // How close to the note beat to count as a hit
 
 // Playback constants
 const PIXELS_PER_BEAT = 80; // Reduced to show more notes
@@ -58,6 +72,7 @@ interface NoteRenderData {
 // Linked note chain for rendering hammer-ons, pull-offs, slides as single bar
 interface LinkedNoteChain {
   notes: Note[];           // All notes in the chain
+  noteIds: string[];       // IDs for each note (for hit/miss tracking)
   techniques: ('h' | 'p' | '/')[];  // Techniques between notes
   stringNumber: number;
   y: number;
@@ -119,12 +134,14 @@ const AnimatedBarLine = ({
 };
 
 // Animated Note Component - renders linked notes with bridges between them
-const AnimatedNote = ({ 
+const AnimatedNote = React.memo(({ 
   chainData, 
-  currentBeat 
+  currentBeat,
+  noteStatuses,
 }: { 
   chainData: LinkedNoteChain; 
   currentBeat: SharedValue<number>;
+  noteStatuses: Record<string, 'hit' | 'miss' | null>;
 }) => {
   // Calculate total width needed for the chain
   const totalWidth = Math.max(chainData.totalDuration * PIXELS_PER_BEAT, 30);
@@ -164,16 +181,43 @@ const AnimatedNote = ({
         // Calculate offset: position relative to chain start
         const noteOffset = (note.beat - chainData.startBeat) * PIXELS_PER_BEAT;
         
+        // Get hit/miss status for this note
+        const noteId = chainData.noteIds[index];
+        const status = noteStatuses[noteId];
+        
+        // Debug log
+        if (status) {
+          console.log('[AnimatedNote RENDER] noteId:', noteId, 'status:', status);
+        }
+        
+        // Determine note color and border based on status
+        let noteColor = stringColor;
+        let borderColor = '#ffffff';
+        if (status === 'hit') {
+          noteColor = '#00FF00'; // Bright green for hit
+          borderColor = '#00FF00';
+        } else if (status === 'miss') {
+          noteColor = '#FF0000'; // Bright red for miss
+          borderColor = '#FF0000';
+        }
+        
         return (
           <React.Fragment key={`note-${index}`}>
             {/* Technique bridge before this note (if not first note) */}
             {technique && (
-              <View style={[styles.techniqueBridge, { backgroundColor: stringColor }]}>
+              <View style={[styles.techniqueBridge, { backgroundColor: noteColor }]}>
                 <Text style={styles.techniqueText}>{technique}</Text>
               </View>
             )}
             {/* The note box */}
-            <View style={[styles.noteBar, { backgroundColor: stringColor, width: noteWidth - (hasNextLink ? TECHNIQUE_BRIDGE_WIDTH / 2 : 0) }]}>
+            <View style={[
+              styles.noteBar, 
+              { 
+                backgroundColor: noteColor, 
+                borderColor: borderColor,
+                width: noteWidth - (hasNextLink ? TECHNIQUE_BRIDGE_WIDTH / 2 : 0) 
+              }
+            ]}>
               <Text style={styles.fretText}>{note.fret}</Text>
             </View>
           </React.Fragment>
@@ -181,7 +225,13 @@ const AnimatedNote = ({
       })}
     </Animated.View>
   );
-};
+}, (prevProps, nextProps) => {
+  // Custom comparison - always re-render when noteStatuses changes
+  if (prevProps.noteStatuses !== nextProps.noteStatuses) {
+    return false; // Return false to trigger re-render
+  }
+  return prevProps.chainData === nextProps.chainData;
+});
 
 export default function PlayalongScreen(): React.JSX.Element {
   const navigation = useNavigation<NavigationProp>();
@@ -192,6 +242,21 @@ export default function PlayalongScreen(): React.JSX.Element {
   const triggeredNotesRef = useRef<Set<string>>(new Set());
   const triggerNotesAtBeatRef = useRef<((beat: number) => void) | null>(null);
   const isPlayingRef = useRef(false); // Sync ref for JS callbacks to check
+  
+  // Pitch detection state
+  const [isPitchDetectionActive, setIsPitchDetectionActive] = useState(false);
+  const [lastDetectedNote, setLastDetectedNote] = useState<number | null>(null);
+  const [hitCount, setHitCount] = useState(0);
+  const [noteStatuses, setNoteStatuses] = useState<Record<string, 'hit' | 'miss' | null>>({});
+  const processedNotesRef = useRef<Set<string>>(new Set()); // Track which notes were already processed
+  
+  // Debug: log noteStatuses changes
+  useEffect(() => {
+    const entries = Object.entries(noteStatuses);
+    if (entries.length > 0) {
+      console.log('[NoteStatuses] Updated:', JSON.stringify(noteStatuses));
+    }
+  }, [noteStatuses]);
   
   const [isPlaying, setIsPlaying] = useState(false);
   const [hasEnded, setHasEnded] = useState(false);
@@ -329,6 +394,18 @@ export default function PlayalongScreen(): React.JSX.Element {
     if (!isPlaying) {
       stopAllSounds();
     }
+    
+    // Start/stop pitch detection with playback
+    if (isPlaying) {
+      // Start pitch detection asynchronously
+      startPitchDetection().then((started) => {
+        console.log('Pitch detection started result:', started);
+        setIsPitchDetectionActive(started);
+      });
+    } else {
+      stopPitchDetection();
+      setIsPitchDetectionActive(false);
+    }
   }, [isPlaying]);
 
   // Wrapper function that calls through ref (for runOnJS to call from worklet)
@@ -378,6 +455,8 @@ export default function PlayalongScreen(): React.JSX.Element {
         if (processedIndices.has(i)) continue;
         
         const chainNotes: Note[] = [sortedNotes[i]];
+        // Use string + beat as unique ID (consistent with audioNotes)
+        const chainNoteIds: string[] = [`${track.string}_${sortedNotes[i].beat}`];
         const techniques: ('h' | 'p' | '/')[] = [];
         let currentIndex = i;
         
@@ -386,6 +465,7 @@ export default function PlayalongScreen(): React.JSX.Element {
           techniques.push(sortedNotes[currentIndex].linkNext!);
           currentIndex++;
           chainNotes.push(sortedNotes[currentIndex]);
+          chainNoteIds.push(`${track.string}_${sortedNotes[currentIndex].beat}`);
           processedIndices.add(currentIndex);
         }
         
@@ -398,6 +478,7 @@ export default function PlayalongScreen(): React.JSX.Element {
         
         chains.push({
           notes: chainNotes,
+          noteIds: chainNoteIds,
           techniques,
           stringNumber: track.string,
           y: getStringY(track.string),
@@ -425,7 +506,6 @@ export default function PlayalongScreen(): React.JSX.Element {
   // Prepare audio notes with technique info
   const audioNotes = useMemo((): AudioNote[] => {
     const notes: AudioNote[] = [];
-    let noteIndex = 0;
     
     for (const track of song.tracks) {
       const sortedTrackNotes = [...track.notes].sort((a, b) => a.beat - b.beat);
@@ -446,8 +526,9 @@ export default function PlayalongScreen(): React.JSX.Element {
           nextFret = sortedTrackNotes[i + 1].fret;
         }
         
+        // Use string + beat as unique ID (matches allNoteChains)
         notes.push({
-          id: `${track.string}_${note.beat}_${noteIndex}`,
+          id: `${track.string}_${note.beat}`,
           beat: note.beat,
           stringNumber: track.string,
           fret: note.fret,
@@ -455,12 +536,94 @@ export default function PlayalongScreen(): React.JSX.Element {
           technique,
           nextFret,
         });
-        noteIndex++;
       }
     }
     
     return notes.sort((a, b) => a.beat - b.beat);
   }, [song]);
+
+  // Debug: Log all note IDs to verify they match between allNoteChains and audioNotes
+  useEffect(() => {
+    const chainNoteIds = allNoteChains.flatMap(chain => chain.noteIds);
+    const audioNoteIds = audioNotes.map(n => n.id);
+    console.log('[DEBUG] Chain Note IDs:', chainNoteIds.slice(0, 5));
+    console.log('[DEBUG] Audio Note IDs:', audioNoteIds.slice(0, 5));
+    
+    // Check for mismatches
+    const chainSet = new Set(chainNoteIds);
+    const audioSet = new Set(audioNoteIds);
+    const inChainNotAudio = chainNoteIds.filter(id => !audioSet.has(id));
+    const inAudioNotChain = audioNoteIds.filter(id => !chainSet.has(id));
+    if (inChainNotAudio.length > 0) console.log('[DEBUG] In chain but not audio:', inChainNotAudio);
+    if (inAudioNotChain.length > 0) console.log('[DEBUG] In audio but not chain:', inAudioNotChain);
+  }, [allNoteChains, audioNotes]);
+
+  // Convert string/fret to MIDI note number
+  const stringFretToMidi = useCallback((stringNum: number, fret: number): number => {
+    // Guitar standard tuning: String 1 = E4(64), String 6 = E2(40)
+    const baseNotes = [64, 59, 55, 50, 45, 40]; // E4, B3, G3, D3, A2, E2
+    return baseNotes[stringNum - 1] + fret;
+  }, []);
+
+  // Get expected note at current beat position
+  const getExpectedNoteAtBeat = useCallback((beat: number): { midi: number; noteId: string } | null => {
+    for (const audioNote of audioNotes) {
+      // Check if this note is within the hit window
+      const noteStart = audioNote.beat;
+      const noteEnd = audioNote.beat + audioNote.len;
+      
+      if (beat >= noteStart - HIT_WINDOW_BEATS && beat <= noteEnd + HIT_WINDOW_BEATS) {
+        const midi = stringFretToMidi(audioNote.stringNumber, audioNote.fret);
+        return { midi, noteId: audioNote.id };
+      }
+    }
+    return null;
+  }, [audioNotes, stringFretToMidi]);
+
+  // Pitch detection listener
+  useEffect(() => {
+    const subscription = addPitchDetectionListener((event) => {
+      const { note: detectedMidi, probability } = event;
+      
+      console.log('[PitchDetect] Received event:', detectedMidi, 'prob:', probability);
+      setLastDetectedNote(detectedMidi);
+      
+      // Get current beat position
+      const currentBeatValue = currentTimeMs.value * beatsPerMs;
+      
+      // Find expected note at current beat
+      const expected = getExpectedNoteAtBeat(currentBeatValue);
+      console.log('[PitchDetect] Beat:', currentBeatValue.toFixed(2), 'Expected:', expected);
+      
+      if (expected) {
+        // Check if we already processed this note
+        if (processedNotesRef.current.has(expected.noteId)) {
+          return; // Already processed
+        }
+        
+        // Check if detected note matches expected (within tolerance)
+        const diff = Math.abs(detectedMidi - expected.midi);
+        console.log('[PitchDetect] Detected MIDI:', detectedMidi, 'Expected MIDI:', expected.midi, 'Diff:', diff);
+        
+        if (diff <= PITCH_MATCH_TOLERANCE) {
+          // HIT!
+          console.log('[PitchDetect] HIT! NoteId:', expected.noteId);
+          processedNotesRef.current.add(expected.noteId);
+          setHitCount(prev => prev + 1);
+          setNoteStatuses(prev => ({ ...prev, [expected.noteId]: 'hit' }));
+        } else {
+          // MISS - wrong note played (but only mark once)
+          console.log('[PitchDetect] MISS! NoteId:', expected.noteId);
+          processedNotesRef.current.add(expected.noteId);
+          setNoteStatuses(prev => ({ ...prev, [expected.noteId]: 'miss' }));
+        }
+      }
+    });
+    
+    return () => {
+      subscription.remove();
+    };
+  }, [beatsPerMs, getExpectedNoteAtBeat]);
 
   // Store playback speed in ref for JS thread access
   const playbackSpeedRef = useRef(1.0);
@@ -674,6 +837,7 @@ export default function PlayalongScreen(): React.JSX.Element {
               key={`chain-${chainData.stringNumber}-${chainData.startBeat}-${index}`}
               chainData={chainData}
               currentBeat={currentBeat}
+              noteStatuses={noteStatuses}
             />
           ))}
         </View>
@@ -689,6 +853,26 @@ export default function PlayalongScreen(): React.JSX.Element {
           backgroundColor: '#ffffff',
           zIndex: 10,
         }))} />
+
+        {/* Pitch Detection Feedback - Bottom Left */}
+        {isPitchDetectionActive && (
+          <View style={styles.pitchFeedbackContainer}>
+            {/* Detected note display */}
+            <View style={styles.detectedNoteContainer}>
+              <Text style={styles.detectedNoteLabel}>Detected:</Text>
+              <Text style={styles.detectedNoteValue}>
+                {lastDetectedNote !== null ? `MIDI ${lastDetectedNote}` : '--'}
+              </Text>
+            </View>
+            
+            {/* Score */}
+            <View style={styles.scoreContainer}>
+              <Text style={styles.scoreText}>
+                Hits: {hitCount}
+              </Text>
+            </View>
+          </View>
+        )}
 
         {/* Play/Pause indicator */}
         <View style={styles.playIndicator}>
@@ -864,5 +1048,41 @@ const styles = StyleSheet.create({
     color: '#888',
     fontSize: 18,
     fontWeight: '500',
+  },
+  // Pitch detection feedback styles
+  pitchFeedbackContainer: {
+    position: 'absolute',
+    bottom: 80,
+    left: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    backgroundColor: 'rgba(15, 52, 96, 0.9)',
+    borderRadius: 12,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    zIndex: 100,
+  },
+  detectedNoteContainer: {
+    alignItems: 'center',
+  },
+  detectedNoteLabel: {
+    color: '#888',
+    fontSize: 10,
+  },
+  detectedNoteValue: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  scoreContainer: {
+    paddingLeft: 10,
+    borderLeftWidth: 1,
+    borderLeftColor: '#444',
+  },
+  scoreText: {
+    color: '#2ecc71',
+    fontSize: 14,
+    fontWeight: 'bold',
   },
 });

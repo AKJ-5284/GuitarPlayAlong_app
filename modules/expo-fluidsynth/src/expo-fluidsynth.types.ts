@@ -17,6 +17,12 @@ export type InitSynthOptions = {
   gain?: number;
 };
 
+export type PitchDetectedEvent = {
+  hz: number;
+  note: number;
+  probability: number;
+};
+
 export interface ExpoFluidsynthModule {
   isInitialized(): boolean;
   getAssetPath(assetName: string): Promise<GetAssetPathResult>;
@@ -30,5 +36,7 @@ export interface ExpoFluidsynthModule {
   allNotesOff(): boolean;
   selectProgram(channel: number, bank: number, preset: number): Promise<boolean>;
   setGain(gain: number): boolean;
+  startPitchDetection(): boolean;
+  stopPitchDetection(): boolean;
   cleanup(): Promise<boolean>;
 }

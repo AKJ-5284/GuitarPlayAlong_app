@@ -3,7 +3,9 @@ package expo.modules.fluidsynth
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
+import android.media.AudioRecord
 import android.media.AudioTrack
+import android.media.MediaRecorder
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -17,6 +19,8 @@ import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.concurrent.thread
+import kotlin.math.log2
+import kotlin.math.roundToInt
 import kotlinx.coroutines.*
 
 /**
@@ -69,11 +73,21 @@ class ExpoFluidsynthModule : Module() {
     private var audioThread: Thread? = null
     @Volatile private var isPlaying: Boolean = false
     
+    // Pitch detection
+    private var pitchDetectionThread: Thread? = null
+    private var audioRecord: AudioRecord? = null
+    @Volatile private var isPitchDetectionRunning: Boolean = false
+    private val PITCH_SAMPLE_RATE = 22050
+    private val PITCH_BUFFER_SIZE = 1024
+    
     private val mainHandler = Handler(Looper.getMainLooper())
     private val fluidsynth: FluidSynthLibrary by lazy { FluidSynthLibrary.INSTANCE }
 
     override fun definition() = ModuleDefinition {
         Name("expo-fluidsynth")
+        
+        // Events for pitch detection callbacks
+        Events("onPitchDetected")
 
         // Check if synth is initialized
         Function("isInitialized") {
@@ -357,6 +371,106 @@ class ExpoFluidsynthModule : Module() {
             true
         }
 
+        // Start pitch detection using device microphone with native YIN algorithm
+        Function("startPitchDetection") {
+            if (isPitchDetectionRunning) {
+                Log.w(TAG, "Pitch detection already running")
+                return@Function true
+            }
+            
+            try {
+                Log.d(TAG, "Starting pitch detection...")
+                
+                // Calculate minimum buffer size for AudioRecord
+                val minBufferSize = AudioRecord.getMinBufferSize(
+                    PITCH_SAMPLE_RATE,
+                    AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT
+                )
+                
+                val bufferSize = maxOf(PITCH_BUFFER_SIZE * 2, minBufferSize)
+                
+                // Create AudioRecord
+                audioRecord = AudioRecord(
+                    MediaRecorder.AudioSource.MIC,
+                    PITCH_SAMPLE_RATE,
+                    AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    bufferSize
+                )
+                
+                if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+                    Log.e(TAG, "Failed to initialize AudioRecord")
+                    audioRecord?.release()
+                    audioRecord = null
+                    return@Function false
+                }
+                
+                isPitchDetectionRunning = true
+                audioRecord?.startRecording()
+                
+                // Start pitch detection on background thread with native YIN
+                pitchDetectionThread = thread(name = "PitchDetection") {
+                    val audioBuffer = ShortArray(PITCH_BUFFER_SIZE)
+                    val floatBuffer = FloatArray(PITCH_BUFFER_SIZE)
+                    
+                    Log.d(TAG, "Pitch detection thread started (native YIN)")
+                    
+                    while (isPitchDetectionRunning && audioRecord != null) {
+                        try {
+                            // Read audio data
+                            val read = audioRecord?.read(audioBuffer, 0, PITCH_BUFFER_SIZE) ?: -1
+                            
+                            if (read > 0) {
+                                // Convert short samples to float [-1.0, 1.0]
+                                for (i in 0 until read) {
+                                    floatBuffer[i] = audioBuffer[i] / 32768.0f
+                                }
+                                
+                                // Run YIN pitch detection
+                                val result = detectPitchYIN(floatBuffer, PITCH_SAMPLE_RATE)
+                                val pitchInHz = result.first
+                                val probability = result.second
+                                
+                                // Only report valid pitches with high confidence
+                                if (pitchInHz > 50.0f && pitchInHz < 2000.0f && probability > 0.8f) {
+                                    // Convert frequency to MIDI note: 69 + 12 * log2(freq / 440)
+                                    val midiNote = (69 + 12 * log2(pitchInHz / 440.0)).roundToInt()
+                                    
+                                    Log.d(TAG, "Pitch detected: ${pitchInHz}Hz, MIDI: $midiNote, prob: $probability")
+                                    
+                                    // Send event to JS
+                                    sendEvent("onPitchDetected", mapOf(
+                                        "hz" to pitchInHz,
+                                        "note" to midiNote,
+                                        "probability" to probability
+                                    ))
+                                }
+                            }
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Error reading audio: ${e.message}")
+                        }
+                    }
+                    
+                    Log.d(TAG, "Pitch detection thread stopped")
+                }
+                
+                Log.d(TAG, "Pitch detection started successfully")
+                true
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to start pitch detection: ${e.message}", e)
+                stopPitchDetectionInternal()
+                false
+            }
+        }
+
+        // Stop pitch detection
+        Function("stopPitchDetection") {
+            Log.d(TAG, "Stopping pitch detection...")
+            stopPitchDetectionInternal()
+            true
+        }
+
         // Cleanup and release resources
         AsyncFunction("cleanup") {
             cleanup()
@@ -415,6 +529,9 @@ class ExpoFluidsynthModule : Module() {
         Log.d(TAG, "Cleaning up FluidSynth resources")
         isInitialized = false
         
+        // Stop pitch detection if running
+        stopPitchDetectionInternal()
+        
         // Stop audio thread
         isPlaying = false
         audioThread?.let {
@@ -456,5 +573,105 @@ class ExpoFluidsynthModule : Module() {
         settings = null
         
         soundfontId = -1
+    }
+    
+    private fun stopPitchDetectionInternal() {
+        isPitchDetectionRunning = false
+        
+        // Stop and release AudioRecord
+        audioRecord?.let {
+            try {
+                it.stop()
+                it.release()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error releasing AudioRecord", e)
+            }
+        }
+        audioRecord = null
+        
+        // Wait for pitch detection thread to finish
+        pitchDetectionThread?.let {
+            try {
+                it.join(500)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error stopping pitch detection thread", e)
+            }
+        }
+        pitchDetectionThread = null
+        
+        Log.d(TAG, "Pitch detection stopped")
+    }
+    
+    /**
+     * YIN pitch detection algorithm implementation.
+     * Returns a Pair of (pitchHz, probability)
+     * Based on: "YIN, a fundamental frequency estimator for speech and music"
+     * by Alain de Cheveigné and Hideki Kawahara
+     */
+    private fun detectPitchYIN(buffer: FloatArray, sampleRate: Int): Pair<Float, Float> {
+        val threshold = 0.15f // YIN threshold for aperiodicity detection
+        val bufferSize = buffer.size
+        val halfSize = bufferSize / 2
+        
+        // Step 1 & 2: Calculate the difference function d(τ)
+        val yinBuffer = FloatArray(halfSize)
+        
+        for (tau in 0 until halfSize) {
+            var sum = 0.0f
+            for (i in 0 until halfSize) {
+                val delta = buffer[i] - buffer[i + tau]
+                sum += delta * delta
+            }
+            yinBuffer[tau] = sum
+        }
+        
+        // Step 3: Cumulative mean normalized difference function d'(τ)
+        yinBuffer[0] = 1.0f
+        var runningSum = 0.0f
+        
+        for (tau in 1 until halfSize) {
+            runningSum += yinBuffer[tau]
+            yinBuffer[tau] = yinBuffer[tau] * tau / runningSum
+        }
+        
+        // Step 4: Absolute threshold - find first tau below threshold
+        var tauEstimate = -1
+        for (tau in 2 until halfSize) {
+            if (yinBuffer[tau] < threshold) {
+                // Step 5: Parabolic interpolation
+                while (tau + 1 < halfSize && yinBuffer[tau + 1] < yinBuffer[tau]) {
+                    tauEstimate = tau + 1
+                }
+                if (tauEstimate == -1) {
+                    tauEstimate = tau
+                }
+                break
+            }
+        }
+        
+        // No pitch found
+        if (tauEstimate == -1) {
+            return Pair(-1.0f, 0.0f)
+        }
+        
+        // Step 6: Parabolic interpolation for better precision
+        val betterTau: Float
+        val x0 = if (tauEstimate > 0) tauEstimate - 1 else tauEstimate
+        val x2 = if (tauEstimate + 1 < halfSize) tauEstimate + 1 else tauEstimate
+        
+        betterTau = if (x0 == tauEstimate || x2 == tauEstimate) {
+            tauEstimate.toFloat()
+        } else {
+            val s0 = yinBuffer[x0]
+            val s1 = yinBuffer[tauEstimate]
+            val s2 = yinBuffer[x2]
+            tauEstimate + (s2 - s0) / (2 * (2 * s1 - s2 - s0))
+        }
+        
+        // Calculate pitch and probability
+        val pitchHz = sampleRate / betterTau
+        val probability = 1.0f - yinBuffer[tauEstimate]
+        
+        return Pair(pitchHz, probability.coerceIn(0.0f, 1.0f))
     }
 }

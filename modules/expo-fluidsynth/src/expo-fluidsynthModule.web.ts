@@ -55,6 +55,15 @@ class ExpoFluidsynthModuleWeb extends NativeModule<{}> implements ExpoFluidsynth
     return false;
   }
 
+  startPitchDetection(): boolean {
+    console.warn('expo-fluidsynth: Pitch detection is not available on web');
+    return false;
+  }
+
+  stopPitchDetection(): boolean {
+    return false;
+  }
+
   async cleanup(): Promise<boolean> {
     return true;
   }
