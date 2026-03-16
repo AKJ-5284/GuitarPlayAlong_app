@@ -1,0 +1,9 @@
+{
+  "platforms": ["apple", "android", "web"],
+  "apple": {
+    "modules": ["ExpoFluidsynthModule"]
+  },
+  "android": {
+    "modules": ["expo.modules.fluidsynth.ExpoFluidsynthModule"]
+  }
+}
