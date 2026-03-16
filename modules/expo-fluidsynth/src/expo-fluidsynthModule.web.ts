@@ -1,6 +1,6 @@
 import { registerWebModule, NativeModule } from 'expo';
 
-import { InitSynthResult, GetAssetPathResult, ExpoFluidsynthModule } from './expo-fluidsynth.types';
+import { InitSynthResult, GetAssetPathResult, ExpoFluidsynthModule, AudioPlaybackResult, MidiPlaybackResult, RenderSongResult, NoteEvent } from './expo-fluidsynth.types';
 
 // Web stub - FluidSynth is only available on Android
 class ExpoFluidsynthModuleWeb extends NativeModule<{}> implements ExpoFluidsynthModule {
@@ -55,17 +55,70 @@ class ExpoFluidsynthModuleWeb extends NativeModule<{}> implements ExpoFluidsynth
     return false;
   }
 
-  startPitchDetection(): boolean {
-    console.warn('expo-fluidsynth: Pitch detection is not available on web');
-    return false;
-  }
-
-  stopPitchDetection(): boolean {
-    return false;
-  }
-
   async cleanup(): Promise<boolean> {
     return true;
+  }
+
+  // Native Audio Player with Time-Stretching
+  async loadAndPlayAudio(_filePath: string, _initialSpeed: number): Promise<AudioPlaybackResult> {
+    console.warn('expo-fluidsynth: Audio playback is not available on web');
+    return { success: false, error: 'Not available on web' };
+  }
+
+  setPlaybackSpeed(_speed: number): boolean {
+    return false;
+  }
+
+  pauseAudio(): boolean {
+    return false;
+  }
+
+  resumeAudio(): boolean {
+    return false;
+  }
+
+  stopAudio(): boolean {
+    return false;
+  }
+
+  seekAudio(_positionMs: number): boolean {
+    return false;
+  }
+
+  getAudioPosition(): number {
+    return -1;
+  }
+
+  getPlaybackSpeed(): number {
+    return 1.0;
+  }
+
+  // FluidSynth MIDI Player (Native Sequencer)
+  async playMidiFile(_filePath: string, _tempoMultiplier: number): Promise<MidiPlaybackResult> {
+    console.warn('expo-fluidsynth: MIDI playback is not available on web');
+    return { success: false, error: 'Not available on web' };
+  }
+
+  setMidiTempo(_tempoMultiplier: number): boolean {
+    return false;
+  }
+
+  stopMidiPlayback(): boolean {
+    return false;
+  }
+
+  seekMidi(_ticks: number): boolean {
+    return false;
+  }
+
+  isMidiPlaying(): boolean {
+    return false;
+  }
+  
+  // Pre-render song to WAV file
+  async renderSongToWav(_notes: NoteEvent[], _outputPath: string, _durationMs: number): Promise<RenderSongResult> {
+    console.warn('expo-fluidsynth: renderSongToWav is not available on web');
+    return { success: false, error: 'Not available on web' };
   }
 }
 

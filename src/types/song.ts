@@ -1,29 +1,64 @@
-// Note on a guitar string
-export interface Note {
-  beat: number;   // The beat position where the note starts (snaps to 0.25 grid)
-  fret: number;   // The fret number (0 = open string)
-  len: number;    // Duration in beats (snaps to 0.25 grid)
-  string: number; // String number (1-6, where 1 is highest) - for easier editing/drag-drop
-  linkNext?: 'h' | 'p' | '/'; // Links to next note: h=hammer-on, p=pull-off, /=slide
+/**
+ * Standard Song Schema for Pitch-Detection Apps
+ */
+export interface SongData {
+  metadata: {
+    id: string;
+    title: string;
+    artist: string;
+    bpm: number;
+    beatsPerBar: number;
+    difficulty: number; // 1-10
+    durationMs: number;
+    // Standard EADGBE is [64, 59, 55, 50, 45, 40] (MIDI Note Numbers)
+    tuning: number[];
+  };
+  // Pre-calculated timing data
+  timing: {
+    msPerBeat: number;
+    pixelsPerBeat: number;
+  };
+  // The actual notes to play
+  tracks: {
+    lead: GuitarEvent[];
+    rhythm?: GuitarEvent[];
+    bass?: GuitarEvent[];
+  };
 }
 
-// A track representing one guitar string
+export interface GuitarEvent {
+  t: number;      // Timestamp (ms) - EXACT moment it hits the line
+  d: number;      // Duration (ms) - for "hold" notes or vibrato
+  s: number;      // String index (0-5, where 0 is high E)
+  f: number;      // Fret number (0 is open)
+  hz: number;     // Target Frequency (pre-calculated for faster comparison)
+  acc?: 's' | 'h' | 'p' | 'b'; // slide, hammer-on, pull-off, bend
+  v?: number;     // Velocity/Intensity (0.0 to 1.0)
+}
+
+// Legacy interfaces retained during schema migration.
+export interface Note {
+  beat: number;
+  fret: number;
+  len: number;
+  string: number;
+  linkNext?: 'h' | 'p' | '/';
+}
+
 export interface Track {
-  string: number; // String number (1-6, where 1 is the thinnest/highest)
+  string: number;
   notes: Note[];
 }
 
-// Complete song structure
 export interface Song {
   id: string;
   name: string;
   bpm: number;
-  beatsPerBar: number; // Time signature (e.g., 4 for 4/4 time)
-  lastModified: number; // Unix timestamp in milliseconds
+  beatsPerBar: number;
+  lastModified: number;
   tracks: Track[];
 }
 
-// Song metadata for listing (without full track data)
 export interface SongMetadata {
   id: string;
   name: string;

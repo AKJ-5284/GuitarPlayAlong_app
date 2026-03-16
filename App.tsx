@@ -44,7 +44,7 @@ export default function App(): React.JSX.Element {
           />
         </Stack.Navigator>
       </NavigationContainer>
-      <StatusBar style="light" />
+      <StatusBar hidden />
     </GestureHandlerRootView>
   );
 }

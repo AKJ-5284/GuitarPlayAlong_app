@@ -1,11 +1,9 @@
 package expo.modules.fluidsynth
 
 import android.media.AudioAttributes
-import android.media.AudioFormat
-import android.media.AudioManager
-import android.media.AudioRecord
-import android.media.AudioTrack
-import android.media.MediaRecorder
+import android.media.MediaPlayer
+import android.media.PlaybackParams
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -14,11 +12,9 @@ import com.sun.jna.Native
 import com.sun.jna.Pointer
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-import kotlin.concurrent.thread
 import kotlin.math.log2
 import kotlin.math.roundToInt
 import kotlinx.coroutines.*
@@ -29,6 +25,15 @@ import kotlinx.coroutines.*
 interface FluidSynthLibrary : Library {
     companion object {
         val INSTANCE: FluidSynthLibrary by lazy {
+            // First load the library using System.loadLibrary to ensure it's in memory
+            try {
+                System.loadLibrary("fluidsynth")
+                android.util.Log.d("ExpoFluidsynth", "Successfully loaded libfluidsynth.so via System.loadLibrary")
+            } catch (e: UnsatisfiedLinkError) {
+                android.util.Log.e("ExpoFluidsynth", "Failed to load libfluidsynth.so: ${e.message}", e)
+                throw e
+            }
+            // Now JNA can find and use it
             Native.load("fluidsynth", FluidSynthLibrary::class.java)
         }
     }
@@ -47,19 +52,30 @@ interface FluidSynthLibrary : Library {
     fun fluid_synth_noteon(synth: Pointer?, chan: Int, key: Int, vel: Int): Int
     fun fluid_synth_noteoff(synth: Pointer?, chan: Int, key: Int): Int
     fun fluid_synth_all_notes_off(synth: Pointer?, chan: Int): Int
+    fun fluid_synth_all_sounds_off(synth: Pointer?, chan: Int): Int
     fun fluid_synth_program_select(synth: Pointer?, chan: Int, sfont_id: Int, bank: Int, preset: Int): Int
     fun fluid_synth_set_gain(synth: Pointer?, gain: Float)
     
     // Audio rendering - write interleaved stereo 16-bit samples
     fun fluid_synth_write_s16(synth: Pointer?, len: Int, lout: ByteArray?, loff: Int, lincr: Int, rout: ByteArray?, roff: Int, rincr: Int): Int
+    
+    // MIDI Player functions for native sequencing
+    fun new_fluid_player(synth: Pointer?): Pointer?
+    fun delete_fluid_player(player: Pointer?): Int
+    fun fluid_player_add(player: Pointer?, midifile: String?): Int
+    fun fluid_player_play(player: Pointer?): Int
+    fun fluid_player_stop(player: Pointer?): Int
+    fun fluid_player_set_tempo(player: Pointer?, tempo_type: Int, tempo: Double): Int
+    fun fluid_player_get_status(player: Pointer?): Int
+    fun fluid_player_seek(player: Pointer?, ticks: Int): Int
 }
 
 class ExpoFluidsynthModule : Module() {
     companion object {
         private const val TAG = "ExpoFluidsynth"
         private const val SAMPLE_RATE = 44100
-        private const val BUFFER_SIZE_FRAMES = 512 // Balanced latency/stability
-        private const val GUITAR_PRESET = 25 // Nylon guitar in General MIDI
+        private const val GUITAR_PRESET = 24 // Acoustic Guitar (nylon) in General MIDI (0-based)
+        private const val GUITAR_TRANSPOSE_SEMITONES = 12
     }
 
     // FluidSynth pointers
@@ -68,17 +84,13 @@ class ExpoFluidsynthModule : Module() {
     private var soundfontId: Int = -1
     private var isInitialized: Boolean = false
     
-    // Audio playback
-    private var audioTrack: AudioTrack? = null
-    private var audioThread: Thread? = null
-    @Volatile private var isPlaying: Boolean = false
+    // Native MediaPlayer for pre-rendered WAV playback
+    private var mediaPlayer: MediaPlayer? = null
+    @Volatile private var currentPlaybackSpeed: Float = 1.0f
     
-    // Pitch detection
-    private var pitchDetectionThread: Thread? = null
-    private var audioRecord: AudioRecord? = null
-    @Volatile private var isPitchDetectionRunning: Boolean = false
-    private val PITCH_SAMPLE_RATE = 22050
-    private val PITCH_BUFFER_SIZE = 1024
+    // FluidSynth MIDI player for native MIDI sequencing (optional)
+    private var fluidPlayer: Pointer? = null
+    @Volatile private var isMidiPlaying: Boolean = false
     
     private val mainHandler = Handler(Looper.getMainLooper())
     private val fluidsynth: FluidSynthLibrary by lazy { FluidSynthLibrary.INSTANCE }
@@ -86,8 +98,12 @@ class ExpoFluidsynthModule : Module() {
     override fun definition() = ModuleDefinition {
         Name("expo-fluidsynth")
         
-        // Events for pitch detection callbacks
-        Events("onPitchDetected")
+        // Events for playback callbacks
+        Events(
+            "onAudioPlaybackComplete",
+            "onAudioPlaybackError",
+            "onMidiPlaybackComplete"
+        )
 
         // Check if synth is initialized
         Function("isInitialized") {
@@ -177,40 +193,13 @@ class ExpoFluidsynthModule : Module() {
 
                 Log.d(TAG, "SoundFont loaded with ID: $soundfontId")
                 
-                // Select guitar preset on all channels (bank 0, preset 25 = nylon guitar)
-                // Try preset 25 (nylon), 27 (clean electric), or 0 depending on soundfont
+                // Select guitar preset on all channels (bank 0, preset 24 = nylon guitar)
                 for (channel in 0..5) {
                     fluidsynth.fluid_synth_program_select(synth, channel, soundfontId, 0, GUITAR_PRESET)
                 }
                 
-                // Create AudioTrack for low-latency playback
-                val bufferSize = AudioTrack.getMinBufferSize(
-                    rate,
-                    AudioFormat.CHANNEL_OUT_STEREO,
-                    AudioFormat.ENCODING_PCM_16BIT
-                )
-                
-                val attributes = AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_GAME)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                    .build()
-                
-                val format = AudioFormat.Builder()
-                    .setSampleRate(rate)
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
-                    .build()
-                
-                audioTrack = AudioTrack.Builder()
-                    .setAudioAttributes(attributes)
-                    .setAudioFormat(format)
-                    .setBufferSizeInBytes(bufferSize.coerceAtLeast(BUFFER_SIZE_FRAMES * 4))
-                    .setTransferMode(AudioTrack.MODE_STREAM)
-                    .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
-                    .build()
-                
-                // Start audio rendering thread
-                startAudioThread(rate)
+                // NOTE: No real-time audio thread needed - we use pre-rendered WAV files
+                // played through MediaPlayer for zero-latency playback
                 
                 isInitialized = true
                 
@@ -283,7 +272,7 @@ class ExpoFluidsynthModule : Module() {
                 return@Function false
             }
 
-            val midiNote = baseNotes[stringNum - 1] + fret
+            val midiNote = baseNotes[stringNum - 1] + fret + GUITAR_TRANSPOSE_SEMITONES
             val channel = stringNum - 1 // Use different channel per string for polyphony
             
             val result = fluidsynth.fluid_synth_noteon(synth, channel, midiNote, velocity)
@@ -302,7 +291,7 @@ class ExpoFluidsynthModule : Module() {
                 return@Function false
             }
 
-            val midiNote = baseNotes[stringNum - 1] + fret
+            val midiNote = baseNotes[stringNum - 1] + fret + GUITAR_TRANSPOSE_SEMITONES
             val channel = stringNum - 1
             
             val result = fluidsynth.fluid_synth_noteoff(synth, channel, midiNote)
@@ -321,8 +310,8 @@ class ExpoFluidsynthModule : Module() {
             }
 
             val channel = stringNum - 1
-            val fromMidi = baseNotes[stringNum - 1] + fromFret
-            val toMidi = baseNotes[stringNum - 1] + toFret
+            val fromMidi = baseNotes[stringNum - 1] + fromFret + GUITAR_TRANSPOSE_SEMITONES
+            val toMidi = baseNotes[stringNum - 1] + toFret + GUITAR_TRANSPOSE_SEMITONES
 
             // Launch coroutine for precise timing
             CoroutineScope(Dispatchers.Default).launch {
@@ -371,104 +360,425 @@ class ExpoFluidsynthModule : Module() {
             true
         }
 
-        // Start pitch detection using device microphone with native YIN algorithm
-        Function("startPitchDetection") {
-            if (isPitchDetectionRunning) {
-                Log.w(TAG, "Pitch detection already running")
-                return@Function true
-            }
-            
+        // ========================================
+        // Native Audio Player with Time-Stretching
+        // ========================================
+        
+        // Load and play an audio file with initial playback speed (pitch-preserving tempo change)
+        AsyncFunction("loadAndPlayAudio") { filePath: String, initialSpeed: Float ->
             try {
-                Log.d(TAG, "Starting pitch detection...")
+                Log.d(TAG, "Loading audio file: $filePath with speed: $initialSpeed")
                 
-                // Calculate minimum buffer size for AudioRecord
-                val minBufferSize = AudioRecord.getMinBufferSize(
-                    PITCH_SAMPLE_RATE,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT
-                )
-                
-                val bufferSize = maxOf(PITCH_BUFFER_SIZE * 2, minBufferSize)
-                
-                // Create AudioRecord
-                audioRecord = AudioRecord(
-                    MediaRecorder.AudioSource.MIC,
-                    PITCH_SAMPLE_RATE,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    bufferSize
-                )
-                
-                if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-                    Log.e(TAG, "Failed to initialize AudioRecord")
-                    audioRecord?.release()
-                    audioRecord = null
-                    return@Function false
+                // Release any existing MediaPlayer
+                mediaPlayer?.let {
+                    try {
+                        if (it.isPlaying) it.stop()
+                        it.release()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error releasing previous MediaPlayer", e)
+                    }
                 }
                 
-                isPitchDetectionRunning = true
-                audioRecord?.startRecording()
-                
-                // Start pitch detection on background thread with native YIN
-                pitchDetectionThread = thread(name = "PitchDetection") {
-                    val audioBuffer = ShortArray(PITCH_BUFFER_SIZE)
-                    val floatBuffer = FloatArray(PITCH_BUFFER_SIZE)
+                // Create new MediaPlayer
+                mediaPlayer = MediaPlayer().apply {
+                    setDataSource(filePath)
                     
-                    Log.d(TAG, "Pitch detection thread started (native YIN)")
+                    // Set audio attributes for low-latency playback
+                    setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_GAME)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                            .build()
+                    )
                     
-                    while (isPitchDetectionRunning && audioRecord != null) {
-                        try {
-                            // Read audio data
-                            val read = audioRecord?.read(audioBuffer, 0, PITCH_BUFFER_SIZE) ?: -1
-                            
-                            if (read > 0) {
-                                // Convert short samples to float [-1.0, 1.0]
-                                for (i in 0 until read) {
-                                    floatBuffer[i] = audioBuffer[i] / 32768.0f
-                                }
-                                
-                                // Run YIN pitch detection
-                                val result = detectPitchYIN(floatBuffer, PITCH_SAMPLE_RATE)
-                                val pitchInHz = result.first
-                                val probability = result.second
-                                
-                                // Only report valid pitches with high confidence
-                                if (pitchInHz > 50.0f && pitchInHz < 2000.0f && probability > 0.8f) {
-                                    // Convert frequency to MIDI note: 69 + 12 * log2(freq / 440)
-                                    val midiNote = (69 + 12 * log2(pitchInHz / 440.0)).roundToInt()
-                                    
-                                    Log.d(TAG, "Pitch detected: ${pitchInHz}Hz, MIDI: $midiNote, prob: $probability")
-                                    
-                                    // Send event to JS
-                                    sendEvent("onPitchDetected", mapOf(
-                                        "hz" to pitchInHz,
-                                        "note" to midiNote,
-                                        "probability" to probability
-                                    ))
-                                }
-                            }
-                        } catch (e: Exception) {
-                            Log.e(TAG, "Error reading audio: ${e.message}")
+                    // Prepare synchronously (blocking)
+                    prepare()
+                    
+                    // Set playback speed using PlaybackParams (Android 6.0+)
+                    // This changes tempo without affecting pitch
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        playbackParams = PlaybackParams().apply {
+                            speed = initialSpeed.coerceIn(0.25f, 4.0f)
+                            pitch = 1.0f // Keep pitch unchanged
                         }
                     }
                     
-                    Log.d(TAG, "Pitch detection thread stopped")
+                    currentPlaybackSpeed = initialSpeed
+                    
+                    // Set completion listener
+                    setOnCompletionListener {
+                        Log.d(TAG, "Audio playback completed")
+                        sendEvent("onAudioPlaybackComplete", mapOf(
+                            "filePath" to filePath
+                        ))
+                    }
+                    
+                    setOnErrorListener { mp, what, extra ->
+                        Log.e(TAG, "MediaPlayer error: what=$what, extra=$extra")
+                        sendEvent("onAudioPlaybackError", mapOf(
+                            "error" to "MediaPlayer error: $what",
+                            "code" to what
+                        ))
+                        true
+                    }
+                    
+                    // Start playback
+                    start()
                 }
                 
-                Log.d(TAG, "Pitch detection started successfully")
-                true
+                Log.d(TAG, "Audio playback started successfully")
+                mapOf(
+                    "success" to true,
+                    "duration" to (mediaPlayer?.duration ?: 0),
+                    "speed" to currentPlaybackSpeed
+                )
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to start pitch detection: ${e.message}", e)
-                stopPitchDetectionInternal()
+                Log.e(TAG, "Failed to load and play audio: ${e.message}", e)
+                mapOf(
+                    "success" to false,
+                    "error" to (e.message ?: "Unknown error")
+                )
+            }
+        }
+        
+        // Set playback speed dynamically (pitch-preserving tempo change)
+        Function("setPlaybackSpeed") { speed: Float ->
+            if (mediaPlayer == null) {
+                Log.w(TAG, "setPlaybackSpeed called but no MediaPlayer active")
+                return@Function false
+            }
+            
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    val clampedSpeed = speed.coerceIn(0.25f, 4.0f)
+                    mediaPlayer?.playbackParams = mediaPlayer?.playbackParams?.setSpeed(clampedSpeed)
+                        ?: PlaybackParams().setSpeed(clampedSpeed).setPitch(1.0f)
+                    currentPlaybackSpeed = clampedSpeed
+                    Log.d(TAG, "Playback speed set to: $clampedSpeed")
+                    true
+                } else {
+                    Log.w(TAG, "PlaybackParams not supported on this Android version")
+                    false
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to set playback speed: ${e.message}", e)
                 false
             }
         }
+        
+        // Pause audio playback
+        Function("pauseAudio") {
+            try {
+                mediaPlayer?.let {
+                    if (it.isPlaying) {
+                        it.pause()
+                        Log.d(TAG, "Audio paused")
+                        return@Function true
+                    }
+                }
+                false
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to pause audio: ${e.message}", e)
+                false
+            }
+        }
+        
+        // Resume audio playback
+        Function("resumeAudio") {
+            try {
+                mediaPlayer?.let {
+                    if (!it.isPlaying) {
+                        it.start()
+                        Log.d(TAG, "Audio resumed")
+                        return@Function true
+                    }
+                }
+                false
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to resume audio: ${e.message}", e)
+                false
+            }
+        }
+        
+        // Stop audio playback
+        Function("stopAudio") {
+            try {
+                mediaPlayer?.let {
+                    if (it.isPlaying) {
+                        it.stop()
+                    }
+                    it.release()
+                }
+                mediaPlayer = null
+                Log.d(TAG, "Audio stopped and released")
+                true
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to stop audio: ${e.message}", e)
+                false
+            }
+        }
+        
+        // Seek to position in milliseconds
+        Function("seekAudio") { positionMs: Int ->
+            try {
+                mediaPlayer?.seekTo(positionMs)
+                Log.d(TAG, "Seeked to position: $positionMs ms")
+                true
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to seek audio: ${e.message}", e)
+                false
+            }
+        }
+        
+        // Get current playback position
+        Function("getAudioPosition") {
+            try {
+                mediaPlayer?.currentPosition ?: -1
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to get audio position: ${e.message}", e)
+                -1
+            }
+        }
+        
+        // Get current playback speed
+        Function("getPlaybackSpeed") {
+            currentPlaybackSpeed
+        }
+        
+        // ========================================
+        // FluidSynth MIDI Player (Native Sequencer)
+        // ========================================
+        
+        // Play a MIDI file using FluidSynth's internal player with tempo control
+        AsyncFunction("playMidiFile") { filePath: String, tempoMultiplier: Float ->
+            if (!isInitialized || synth == null) {
+                return@AsyncFunction mapOf(
+                    "success" to false,
+                    "error" to "FluidSynth not initialized"
+                )
+            }
+            
+            try {
+                Log.d(TAG, "Loading MIDI file: $filePath with tempo multiplier: $tempoMultiplier")
+                
+                // Note: MIDI playback is not supported in pre-render mode
+                // Use renderSongToWav instead for audio playback
+                Log.w(TAG, "MIDI playback disabled - use pre-rendered WAV playback instead")
+                return@AsyncFunction mapOf(
+                    "success" to false,
+                    "error" to "MIDI playback not supported. Use renderSongToWav for pre-rendered audio."
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to play MIDI file: ${e.message}", e)
+                mapOf(
+                    "success" to false,
+                    "error" to (e.message ?: "Unknown error")
+                )
+            }
+        }
+        
+        // Set MIDI playback tempo dynamically (disabled in pre-render mode)
+        Function("setMidiTempo") { tempoMultiplier: Float ->
+            Log.w(TAG, "MIDI tempo control disabled - use setPlaybackSpeed for WAV playback")
+            false
+        }
+        
+        // Stop MIDI playback (disabled in pre-render mode)
+        Function("stopMidiPlayback") {
+            Log.w(TAG, "MIDI playback disabled - use stopAudio for WAV playback")
+            false
+        }
+        
+        // Seek MIDI player (disabled in pre-render mode)
+        Function("seekMidi") { ticks: Int ->
+            Log.w(TAG, "MIDI seek disabled - use seekAudio for WAV playback")
+            false
+        }
+        
+        // Check if MIDI is currently playing (always false in pre-render mode)
+        Function("isMidiPlaying") {
+            false
+        }
 
-        // Stop pitch detection
-        Function("stopPitchDetection") {
-            Log.d(TAG, "Stopping pitch detection...")
-            stopPitchDetectionInternal()
-            true
+        // ========================================
+        // Pre-render Song to WAV File
+        // ========================================
+        
+        /**
+         * Render a song to a WAV file for zero-latency playback.
+         * Takes an array of note events and renders them offline using FluidSynth.
+         * 
+         * Note format: [timeMs, channel, midiNote, velocity, durationMs]
+         */
+        AsyncFunction("renderSongToWav") { notes: List<List<Double>>, outputPath: String, durationMs: Double ->
+            if (!isInitialized || synth == null) {
+                return@AsyncFunction mapOf(
+                    "success" to false,
+                    "error" to "FluidSynth not initialized"
+                )
+            }
+            
+            try {
+                Log.d(TAG, "Rendering ${notes.size} notes to WAV: $outputPath")
+                
+                // Reset synth state before rendering - turn off all notes and reset
+                for (ch in 0..15) {
+                    fluidsynth.fluid_synth_all_notes_off(synth, ch)
+                    fluidsynth.fluid_synth_all_sounds_off(synth, ch)
+                }
+                
+                // Re-select guitar program on channels 0-5 to ensure correct instrument
+                for (channel in 0..5) {
+                    fluidsynth.fluid_synth_program_select(synth, channel, soundfontId, 0, GUITAR_PRESET)
+                }
+                
+                // Small delay to let notes release fully
+                Thread.sleep(50)
+                
+                val sampleRate = SAMPLE_RATE
+                val totalSamples = ((durationMs / 1000.0) * sampleRate).toInt() + sampleRate // Extra second for release tails
+                val bytesPerSample = 4 // Stereo 16-bit = 4 bytes per frame
+                val totalBytes = totalSamples * bytesPerSample
+                
+                Log.d(TAG, "Total duration: ${durationMs}ms, samples: $totalSamples, bytes: $totalBytes")
+                
+                // Create sorted list of note events (on/off)
+                data class NoteEvent(val samplePos: Int, val isOn: Boolean, val channel: Int, val note: Int, val velocity: Int)
+                val events = mutableListOf<NoteEvent>()
+                
+                for (noteData in notes) {
+                    if (noteData.size < 5) continue
+                    
+                    val timeMs = noteData[0]
+                    val channel = noteData[1].toInt()
+                    val midiNote = noteData[2].toInt()
+                    val velocity = noteData[3].toInt()
+                    val noteDurationMs = noteData[4]
+                    
+                    val startSample = ((timeMs / 1000.0) * sampleRate).toInt()
+                    val endSample = (((timeMs + noteDurationMs) / 1000.0) * sampleRate).toInt()
+                    
+                    events.add(NoteEvent(startSample, true, channel, midiNote, velocity))
+                    events.add(NoteEvent(endSample, false, channel, midiNote, 0))
+                }
+                
+                // Sort by sample position
+                events.sortBy { it.samplePos }
+                
+                Log.d(TAG, "Processing ${events.size} note events")
+                if (events.isNotEmpty()) {
+                    Log.d(TAG, "First event at sample ${events.first().samplePos}, last at ${events.last().samplePos}")
+                    // Log first 10 note-on events for debugging
+                    events.filter { it.isOn }.take(10).forEachIndexed { i, e ->
+                        Log.d(TAG, "Note $i: time=${e.samplePos / sampleRate.toFloat()}s, ch=${e.channel}, note=${e.note}, vel=${e.velocity}")
+                    }
+                }
+                
+                // Render audio sample-by-sample for accurate timing
+                // We render one sample at a time when there are events, otherwise in chunks
+                val outputBuffer = ByteArrayOutputStream(totalBytes)
+                val sampleBuffer = ByteArray(4) // Single stereo sample (2 channels * 2 bytes)
+                
+                var currentSample = 0
+                var eventIndex = 0
+                var notesTriggered = 0
+                
+                // Process all samples
+                while (currentSample < totalSamples) {
+                    // Process any note events at exactly this sample position
+                    while (eventIndex < events.size && events[eventIndex].samplePos <= currentSample) {
+                        val event = events[eventIndex]
+                        if (event.isOn) {
+                            fluidsynth.fluid_synth_noteon(synth, event.channel, event.note, event.velocity)
+                            notesTriggered++
+                        } else {
+                            fluidsynth.fluid_synth_noteoff(synth, event.channel, event.note)
+                        }
+                        eventIndex++
+                    }
+                    
+                    // Determine how many samples we can render before the next event
+                    val nextEventSample = if (eventIndex < events.size) events[eventIndex].samplePos else totalSamples
+                    val samplesToRender = minOf(nextEventSample - currentSample, 2048) // Cap at 2048 for memory efficiency
+                    
+                    if (samplesToRender > 1) {
+                        // Render multiple samples at once
+                        val chunkBuffer = ByteArray(samplesToRender * 4)
+                        fluidsynth.fluid_synth_write_s16(
+                            synth,
+                            samplesToRender,
+                            chunkBuffer, 0, 2,  // Left channel: start at short 0, increment by 2
+                            chunkBuffer, 1, 2   // Right channel: start at short 1, increment by 2
+                        )
+                        outputBuffer.write(chunkBuffer)
+                        currentSample += samplesToRender
+                    } else {
+                        // Render single sample
+                        fluidsynth.fluid_synth_write_s16(
+                            synth,
+                            1,
+                            sampleBuffer, 0, 2,
+                            sampleBuffer, 1, 2
+                        )
+                        outputBuffer.write(sampleBuffer)
+                        currentSample++
+                    }
+                }
+                
+                Log.d(TAG, "Triggered $notesTriggered note-on events during rendering")
+                
+                // Turn off all notes
+                for (ch in 0..15) {
+                    fluidsynth.fluid_synth_all_notes_off(synth, ch)
+                }
+                
+                // Get raw PCM data
+                val pcmData = outputBuffer.toByteArray()
+                Log.d(TAG, "Rendered ${pcmData.size} bytes of PCM data")
+                
+                // Write WAV file
+                val wavFile = File(outputPath)
+                FileOutputStream(wavFile).use { fos ->
+                    // WAV header
+                    val dataSize = pcmData.size
+                    val fileSize = dataSize + 36
+                    
+                    // RIFF header
+                    fos.write("RIFF".toByteArray())
+                    fos.write(intToLittleEndianBytes(fileSize))
+                    fos.write("WAVE".toByteArray())
+                    
+                    // fmt chunk
+                    fos.write("fmt ".toByteArray())
+                    fos.write(intToLittleEndianBytes(16)) // Chunk size
+                    fos.write(shortToLittleEndianBytes(1)) // Audio format (PCM)
+                    fos.write(shortToLittleEndianBytes(2)) // Channels (stereo)
+                    fos.write(intToLittleEndianBytes(sampleRate)) // Sample rate
+                    fos.write(intToLittleEndianBytes(sampleRate * 4)) // Byte rate (sampleRate * channels * bitsPerSample/8)
+                    fos.write(shortToLittleEndianBytes(4)) // Block align (channels * bitsPerSample/8)
+                    fos.write(shortToLittleEndianBytes(16)) // Bits per sample
+                    
+                    // data chunk
+                    fos.write("data".toByteArray())
+                    fos.write(intToLittleEndianBytes(dataSize))
+                    fos.write(pcmData)
+                }
+                
+                Log.d(TAG, "WAV file written: ${wavFile.absolutePath} (${wavFile.length()} bytes)")
+                
+                mapOf(
+                    "success" to true,
+                    "path" to wavFile.absolutePath,
+                    "durationMs" to durationMs,
+                    "sizeBytes" to wavFile.length()
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to render song to WAV: ${e.message}", e)
+                mapOf(
+                    "success" to false,
+                    "error" to (e.message ?: "Unknown error")
+                )
+            }
         }
 
         // Cleanup and release resources
@@ -483,76 +793,25 @@ class ExpoFluidsynthModule : Module() {
         }
     }
     
-    private fun startAudioThread(sampleRate: Int) {
-        isPlaying = true
-        audioTrack?.play()
-        
-        audioThread = thread(name = "FluidSynthAudio", priority = Thread.MAX_PRIORITY) {
-            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
-            
-            // Buffer for stereo 16-bit samples (interleaved)
-            val framesToRender = BUFFER_SIZE_FRAMES
-            val bytesPerFrame = 4 // 2 channels * 2 bytes per sample
-            val buffer = ByteArray(framesToRender * bytesPerFrame)
-            
-            Log.d(TAG, "Audio thread started, rendering $framesToRender frames per cycle")
-            
-            while (isPlaying && synth != null) {
-                try {
-                    // Render audio from FluidSynth
-                    // fluid_synth_write_s16: offsets/increments are in SAMPLES (shorts), not bytes
-                    // For interleaved stereo: L at 0,2,4..., R at 1,3,5...
-                    val result = fluidsynth.fluid_synth_write_s16(
-                        synth,
-                        framesToRender,
-                        buffer, 0, 2,  // Left channel: start at sample 0, increment by 2
-                        buffer, 1, 2   // Right channel: start at sample 1, increment by 2
-                    )
-                    
-                    if (result == 0) {
-                        // Write to AudioTrack
-                        val written = audioTrack?.write(buffer, 0, buffer.size) ?: 0
-                        if (written < 0) {
-                            Log.e(TAG, "AudioTrack write error: $written")
-                        }
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Audio render error: ${e.message}")
-                }
-            }
-            
-            Log.d(TAG, "Audio thread stopped")
-        }
-    }
-
     private fun cleanup() {
         Log.d(TAG, "Cleaning up FluidSynth resources")
         isInitialized = false
         
-        // Stop pitch detection if running
-        stopPitchDetectionInternal()
-        
-        // Stop audio thread
-        isPlaying = false
-        audioThread?.let {
-            try {
-                it.join(500)
-            } catch (e: Exception) {
-                Log.e(TAG, "Error stopping audio thread", e)
-            }
-        }
-        audioThread = null
-        
-        // Stop and release AudioTrack
-        audioTrack?.let {
-            try {
-                it.stop()
+        // Stop and release MediaPlayer
+        try {
+            mediaPlayer?.let {
+                if (it.isPlaying) {
+                    it.stop()
+                }
                 it.release()
-            } catch (e: Exception) {
-                Log.e(TAG, "Error releasing AudioTrack", e)
             }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error releasing MediaPlayer", e)
         }
-        audioTrack = null
+        mediaPlayer = null
+        
+        // Stop and release FluidSynth MIDI player
+        stopMidiPlayerInternal()
 
         synth?.let {
             try {
@@ -575,103 +834,34 @@ class ExpoFluidsynthModule : Module() {
         soundfontId = -1
     }
     
-    private fun stopPitchDetectionInternal() {
-        isPitchDetectionRunning = false
+    private fun stopMidiPlayerInternal() {
+        isMidiPlaying = false
         
-        // Stop and release AudioRecord
-        audioRecord?.let {
+        fluidPlayer?.let {
             try {
-                it.stop()
-                it.release()
+                fluidsynth.fluid_player_stop(it)
+                fluidsynth.delete_fluid_player(it)
             } catch (e: Exception) {
-                Log.e(TAG, "Error releasing AudioRecord", e)
+                Log.e(TAG, "Error stopping MIDI player", e)
             }
         }
-        audioRecord = null
-        
-        // Wait for pitch detection thread to finish
-        pitchDetectionThread?.let {
-            try {
-                it.join(500)
-            } catch (e: Exception) {
-                Log.e(TAG, "Error stopping pitch detection thread", e)
-            }
-        }
-        pitchDetectionThread = null
-        
-        Log.d(TAG, "Pitch detection stopped")
+        fluidPlayer = null
     }
     
-    /**
-     * YIN pitch detection algorithm implementation.
-     * Returns a Pair of (pitchHz, probability)
-     * Based on: "YIN, a fundamental frequency estimator for speech and music"
-     * by Alain de Cheveigné and Hideki Kawahara
-     */
-    private fun detectPitchYIN(buffer: FloatArray, sampleRate: Int): Pair<Float, Float> {
-        val threshold = 0.15f // YIN threshold for aperiodicity detection
-        val bufferSize = buffer.size
-        val halfSize = bufferSize / 2
-        
-        // Step 1 & 2: Calculate the difference function d(τ)
-        val yinBuffer = FloatArray(halfSize)
-        
-        for (tau in 0 until halfSize) {
-            var sum = 0.0f
-            for (i in 0 until halfSize) {
-                val delta = buffer[i] - buffer[i + tau]
-                sum += delta * delta
-            }
-            yinBuffer[tau] = sum
-        }
-        
-        // Step 3: Cumulative mean normalized difference function d'(τ)
-        yinBuffer[0] = 1.0f
-        var runningSum = 0.0f
-        
-        for (tau in 1 until halfSize) {
-            runningSum += yinBuffer[tau]
-            yinBuffer[tau] = yinBuffer[tau] * tau / runningSum
-        }
-        
-        // Step 4: Absolute threshold - find first tau below threshold
-        var tauEstimate = -1
-        for (tau in 2 until halfSize) {
-            if (yinBuffer[tau] < threshold) {
-                // Step 5: Parabolic interpolation
-                while (tau + 1 < halfSize && yinBuffer[tau + 1] < yinBuffer[tau]) {
-                    tauEstimate = tau + 1
-                }
-                if (tauEstimate == -1) {
-                    tauEstimate = tau
-                }
-                break
-            }
-        }
-        
-        // No pitch found
-        if (tauEstimate == -1) {
-            return Pair(-1.0f, 0.0f)
-        }
-        
-        // Step 6: Parabolic interpolation for better precision
-        val betterTau: Float
-        val x0 = if (tauEstimate > 0) tauEstimate - 1 else tauEstimate
-        val x2 = if (tauEstimate + 1 < halfSize) tauEstimate + 1 else tauEstimate
-        
-        betterTau = if (x0 == tauEstimate || x2 == tauEstimate) {
-            tauEstimate.toFloat()
-        } else {
-            val s0 = yinBuffer[x0]
-            val s1 = yinBuffer[tauEstimate]
-            val s2 = yinBuffer[x2]
-            tauEstimate + (s2 - s0) / (2 * (2 * s1 - s2 - s0))
-        }
-        
-        // Calculate pitch and probability
-        val pitchHz = sampleRate / betterTau
-        val probability = 1.0f - yinBuffer[tauEstimate]
-        
-        return Pair(pitchHz, probability.coerceIn(0.0f, 1.0f))
+    // WAV file helper functions
+    private fun intToLittleEndianBytes(value: Int): ByteArray {
+        return byteArrayOf(
+            (value and 0xFF).toByte(),
+            ((value shr 8) and 0xFF).toByte(),
+            ((value shr 16) and 0xFF).toByte(),
+            ((value shr 24) and 0xFF).toByte()
+        )
+    }
+    
+    private fun shortToLittleEndianBytes(value: Int): ByteArray {
+        return byteArrayOf(
+            (value and 0xFF).toByte(),
+            ((value shr 8) and 0xFF).toByte()
+        )
     }
 }

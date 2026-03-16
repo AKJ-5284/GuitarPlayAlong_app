@@ -18,6 +18,8 @@ import { preloadSamplesForSong, initAudio } from '../audio/guitarAudio';
 
 type NavigationProp = NativeStackNavigationProp<RootStackParamList, 'Songs'>;
 
+const EXTRA_LEFT_INSET = 16;
+
 export default function SongsScreen(): React.JSX.Element {
   const navigation = useNavigation<NavigationProp>();
   const [songs, setSongs] = useState<SongMetadata[]>([]);
@@ -263,7 +265,8 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: 20,
+    paddingLeft: 20 + EXTRA_LEFT_INSET,
+    paddingRight: 20,
     paddingTop: 8,
     paddingBottom: 12,
   },
@@ -285,7 +288,8 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   listContent: {
-    paddingHorizontal: 20,
+    paddingLeft: 20 + EXTRA_LEFT_INSET,
+    paddingRight: 20,
     paddingBottom: 20,
   },
   songItem: {
@@ -338,7 +342,8 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: 20,
+    paddingLeft: 20 + EXTRA_LEFT_INSET,
+    paddingRight: 20,
     paddingVertical: 12,
     backgroundColor: '#0f3460',
     marginBottom: 8,

@@ -1,5 +1,5 @@
 import { Paths, File, Directory } from 'expo-file-system';
-import { Song, SongMetadata, Note, Track } from '../types/song';
+import { Song, SongMetadata, Note, Track, SongData, GuitarEvent } from '../types/song';
 import { DEFAULT_SONGS } from '../data/defaultSongs';
 
 // Grid snap value for beat positions and durations
@@ -10,6 +10,128 @@ export const GRID_SNAP = 0.25;
  */
 export const snapToGrid = (value: number): number => {
   return Math.round(value / GRID_SNAP) * GRID_SNAP;
+};
+
+const DEFAULT_TUNING = [64, 59, 55, 50, 45, 40];
+
+const isSongData = (value: Song | SongData): value is SongData => {
+  return 'metadata' in value && 'timing' in value;
+};
+
+const mapLinkToAccent = (link?: 'h' | 'p' | '/'): GuitarEvent['acc'] => {
+  if (link === '/') return 's';
+  return link;
+};
+
+const mapAccentToLink = (accent?: GuitarEvent['acc']): Note['linkNext'] => {
+  if (accent === 's') return '/';
+  if (accent === 'h' || accent === 'p') return accent;
+  return undefined;
+};
+
+const midiToHz = (midiNote: number): number => {
+  return 440 * Math.pow(2, (midiNote - 69) / 12);
+};
+
+const computeDurationMsFromEvents = (events: GuitarEvent[]): number => {
+  let maxEnd = 0;
+  for (const event of events) {
+    const end = event.t + event.d;
+    if (end > maxEnd) {
+      maxEnd = end;
+    }
+  }
+  return maxEnd;
+};
+
+const songToSongData = (song: Song): SongData => {
+  const msPerBeat = 60000 / song.bpm;
+  const lead: GuitarEvent[] = [];
+
+  for (const track of song.tracks) {
+    for (const note of track.notes) {
+      const stringIndex = Math.max(0, Math.min(5, track.string - 1));
+      const midiNote = DEFAULT_TUNING[stringIndex] + note.fret;
+      lead.push({
+        t: Math.round(note.beat * msPerBeat),
+        d: Math.max(1, Math.round(note.len * msPerBeat)),
+        s: stringIndex,
+        f: note.fret,
+        hz: midiToHz(midiNote),
+        acc: mapLinkToAccent(note.linkNext),
+      });
+    }
+  }
+
+  lead.sort((a, b) => a.t - b.t);
+
+  return {
+    metadata: {
+      id: song.id,
+      title: song.name,
+      artist: 'Unknown',
+      bpm: song.bpm,
+      beatsPerBar: song.beatsPerBar,
+      difficulty: 3,
+      durationMs: computeDurationMsFromEvents(lead),
+      tuning: [...DEFAULT_TUNING],
+    },
+    timing: {
+      msPerBeat,
+      pixelsPerBeat: 80,
+    },
+    tracks: {
+      lead,
+    },
+  };
+};
+
+const songDataToSong = (songData: SongData): Song => {
+  const msPerBeat = songData.timing.msPerBeat > 0
+    ? songData.timing.msPerBeat
+    : (60000 / songData.metadata.bpm);
+  const allEvents = [
+    ...songData.tracks.lead,
+    ...(songData.tracks.rhythm || []),
+    ...(songData.tracks.bass || []),
+  ];
+
+  const tracks = Array.from({ length: 6 }, (_, idx) => ({
+    string: idx + 1,
+    notes: [] as Note[],
+  }));
+
+  for (const event of allEvents) {
+    const stringNumber = Math.max(1, Math.min(6, event.s + 1));
+    tracks[stringNumber - 1].notes.push({
+      beat: snapToGrid(event.t / msPerBeat),
+      fret: Math.max(0, Math.min(24, event.f)),
+      len: Math.max(GRID_SNAP, snapToGrid(event.d / msPerBeat)),
+      string: stringNumber,
+      linkNext: mapAccentToLink(event.acc),
+    });
+  }
+
+  for (const track of tracks) {
+    track.notes.sort((a, b) => a.beat - b.beat);
+  }
+
+  return {
+    id: songData.metadata.id,
+    name: songData.metadata.title,
+    bpm: songData.metadata.bpm,
+    beatsPerBar: songData.metadata.beatsPerBar || 4,
+    lastModified: Date.now(),
+    tracks,
+  };
+};
+
+const normalizeToSongData = (songLike: Song | SongData): SongData => {
+  return isSongData(songLike) ? songLike : songToSongData(songLike);
+};
+
+const normalizeToSong = (songLike: Song | SongData): Song => {
+  return isSongData(songLike) ? songDataToSong(songLike) : songLike;
 };
 
 /**
@@ -118,17 +240,24 @@ const getSongFile = (songId: string): File => {
 /**
  * Saves a song to local storage
  */
-export const saveSong = (song: Song): void => {
+export const saveSong = (song: Song | SongData): void => {
   ensureSongsDirectory();
-  
-  // Update lastModified timestamp
-  const songToSave: Song = {
-    ...song,
-    lastModified: Date.now(),
+
+  const songToSave = normalizeToSongData(song);
+  const updatedSongToSave: SongData = {
+    ...songToSave,
+    metadata: {
+      ...songToSave.metadata,
+      durationMs: computeDurationMsFromEvents([
+        ...songToSave.tracks.lead,
+        ...(songToSave.tracks.rhythm || []),
+        ...(songToSave.tracks.bass || []),
+      ]),
+    },
   };
-  
-  const file = getSongFile(song.id);
-  file.write(JSON.stringify(songToSave, null, 2));
+
+  const file = getSongFile(updatedSongToSave.metadata.id);
+  file.write(JSON.stringify(updatedSongToSave, null, 2));
 };
 
 /**
@@ -143,9 +272,30 @@ export const loadSong = async (songId: string): Promise<Song | null> => {
     }
     
     const content = await file.text();
-    return JSON.parse(content) as Song;
+    const parsed = JSON.parse(content) as Song | SongData;
+    return normalizeToSong(parsed);
   } catch (error) {
     console.error('Error loading song:', error);
+    return null;
+  }
+};
+
+/**
+ * Loads a song by ID as SongData schema.
+ */
+export const loadSongData = async (songId: string): Promise<SongData | null> => {
+  try {
+    const file = getSongFile(songId);
+
+    if (!file.exists) {
+      return null;
+    }
+
+    const content = await file.text();
+    const parsed = JSON.parse(content) as Song | SongData;
+    return normalizeToSongData(parsed);
+  } catch (error) {
+    console.error('Error loading song data:', error);
     return null;
   }
 };
@@ -182,13 +332,18 @@ export const listSongs = async (): Promise<SongMetadata[]> => {
       if (item instanceof File && item.uri.endsWith('.json')) {
         try {
           const content = await item.text();
-          const song = JSON.parse(content) as Song;
+          const song = JSON.parse(content) as Song | SongData;
+          const normalizedSong = normalizeToSong(song);
+          const fallbackLastModified = item.modificationTime ? Math.floor(item.modificationTime) : Date.now();
+          const lastModified = isSongData(song)
+            ? fallbackLastModified
+            : (song.lastModified || fallbackLastModified);
           songs.push({
-            id: song.id,
-            name: song.name,
-            bpm: song.bpm,
-            beatsPerBar: song.beatsPerBar || 4,
-            lastModified: song.lastModified,
+            id: normalizedSong.id,
+            name: normalizedSong.name,
+            bpm: normalizedSong.bpm,
+            beatsPerBar: normalizedSong.beatsPerBar || 4,
+            lastModified,
           });
         } catch {
           // Skip corrupted files
@@ -290,7 +445,7 @@ export const duplicateSong = async (songId: string): Promise<Song | null> => {
  * Exports song as JSON string (for sharing)
  */
 export const exportSongAsJson = async (songId: string): Promise<string | null> => {
-  const song = await loadSong(songId);
+  const song = await loadSongData(songId);
   return song ? JSON.stringify(song, null, 2) : null;
 };
 
@@ -299,15 +454,16 @@ export const exportSongAsJson = async (songId: string): Promise<string | null> =
  */
 export const importSongFromJson = (jsonString: string): Song | null => {
   try {
-    const song = JSON.parse(jsonString) as Song;
-    
+    const songLike = JSON.parse(jsonString) as Song | SongData;
+    const normalizedSong = normalizeToSong(songLike);
+
     // Assign a new ID to avoid conflicts
     const importedSong: Song = {
-      ...song,
+      ...normalizedSong,
       id: generateSongId(),
       lastModified: Date.now(),
     };
-    
+
     saveSong(importedSong);
     return importedSong;
   } catch (error) {
@@ -342,10 +498,10 @@ export const initializeDefaultSongs = (): void => {
   
   // Check each default song and add if missing
   for (const song of DEFAULT_SONGS) {
-    const songFile = getSongFile(song.id);
+    const songFile = getSongFile(song.metadata.id);
     if (!songFile.exists) {
       saveSong(song);
-      console.log(`Added default song: ${song.name}`);
+      console.log(`Added default song: ${song.metadata.title}`);
     }
   }
 

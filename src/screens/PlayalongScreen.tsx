@@ -1,38 +1,22 @@
 import React, { useState, useCallback, useMemo, useRef, useEffect } from 'react';
-import { StyleSheet, View, Text, TouchableOpacity, Dimensions, Pressable } from 'react-native';
+import { StyleSheet, View, Text, TouchableOpacity, Dimensions, Pressable, GestureResponderEvent } from 'react-native';
 import Animated, { 
-  useSharedValue, 
-  useFrameCallback, 
+  useSharedValue,
   useDerivedValue,
   useAnimatedStyle,
   SharedValue,
-  runOnJS,
   withTiming,
 } from 'react-native-reanimated';
 import { useNavigation, useRoute, RouteProp } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
-import { Song, Note } from '../types/song';
+import { Song, Note, SongData, GuitarEvent } from '../types/song';
 import { RootStackParamList } from '../../App';
-import { 
-  initAudio, 
-  playNote, 
-  playLegato, 
-  playSlide, 
-  stopAllSounds, 
-  unloadAllSamples,
-  startPitchDetection,
-  stopPitchDetection,
-  addPitchDetectionListener,
-} from '../audio/guitarAudio';
+import { useGameplayEngine } from '../hooks/useGameplayEngine';
 
 type PlayalongRouteProp = RouteProp<RootStackParamList, 'Playalong'>;
 type NavigationProp = NativeStackNavigationProp<RootStackParamList>;
 
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
-
-// Pitch detection constants
-const PITCH_MATCH_TOLERANCE = 1; // Allow +/- 1 semitone for a "hit"
-const HIT_WINDOW_BEATS = 0.5; // How close to the note beat to count as a hit
 
 // Playback constants
 const PIXELS_PER_BEAT = 80; // Reduced to show more notes
@@ -47,6 +31,11 @@ const TECHNIQUE_BRIDGE_WIDTH = 24; // Width of the technique indicator between n
 const MAX_BOUNCE_Y = 30;
 const MIN_BOUNCE_V = 10;
 const NOTE_TOP_OFFSET = 20;
+const BOUNCE_MAP_FPS = 60;
+const BOUNCE_FRAME_DURATION_MS = 1000 / BOUNCE_MAP_FPS;
+const SEEK_STEP_MS = 5000;
+const DOUBLE_TAP_WINDOW_MS = 280;
+const SEEK_INDICATOR_VISIBLE_MS = 700;
 
 // Calculate STRING_AREA_TOP dynamically to center strings vertically
 const TOTAL_STRINGS_HEIGHT = 5 * STRING_SPACING; // 5 gaps between 6 strings
@@ -69,26 +58,24 @@ interface NoteRenderData {
   baseBeat: number;
 }
 
+interface VisualNote {
+  beat: number;
+  len: number;
+  fret: number;
+  string: number;
+  stringY: number;
+  stringNumber: number;
+  linkNext?: 'h' | 'p' | '/';
+}
+
 // Linked note chain for rendering hammer-ons, pull-offs, slides as single bar
 interface LinkedNoteChain {
-  notes: Note[];           // All notes in the chain
-  noteIds: string[];       // IDs for each note (for hit/miss tracking)
+  notes: VisualNote[];           // All notes in the chain
   techniques: ('h' | 'p' | '/')[];  // Techniques between notes
   stringNumber: number;
   y: number;
   startBeat: number;       // First note's beat
   totalDuration: number;   // Combined duration from first note start to last note end
-}
-
-// Audio note for triggering sounds
-interface AudioNote {
-  id: string;
-  beat: number;
-  stringNumber: number;
-  fret: number;
-  len: number;
-  technique: 'h' | 'p' | '/' | null; // technique that leads TO this note
-  nextFret?: number; // for slides, the target fret
 }
 
 // Animated Bar Line Component
@@ -134,14 +121,12 @@ const AnimatedBarLine = ({
 };
 
 // Animated Note Component - renders linked notes with bridges between them
-const AnimatedNote = React.memo(({ 
+const AnimatedNote = ({ 
   chainData, 
-  currentBeat,
-  noteStatuses,
+  currentBeat 
 }: { 
   chainData: LinkedNoteChain; 
   currentBeat: SharedValue<number>;
-  noteStatuses: Record<string, 'hit' | 'miss' | null>;
 }) => {
   // Calculate total width needed for the chain
   const totalWidth = Math.max(chainData.totalDuration * PIXELS_PER_BEAT, 30);
@@ -181,43 +166,16 @@ const AnimatedNote = React.memo(({
         // Calculate offset: position relative to chain start
         const noteOffset = (note.beat - chainData.startBeat) * PIXELS_PER_BEAT;
         
-        // Get hit/miss status for this note
-        const noteId = chainData.noteIds[index];
-        const status = noteStatuses[noteId];
-        
-        // Debug log
-        if (status) {
-          console.log('[AnimatedNote RENDER] noteId:', noteId, 'status:', status);
-        }
-        
-        // Determine note color and border based on status
-        let noteColor = stringColor;
-        let borderColor = '#ffffff';
-        if (status === 'hit') {
-          noteColor = '#00FF00'; // Bright green for hit
-          borderColor = '#00FF00';
-        } else if (status === 'miss') {
-          noteColor = '#FF0000'; // Bright red for miss
-          borderColor = '#FF0000';
-        }
-        
         return (
           <React.Fragment key={`note-${index}`}>
             {/* Technique bridge before this note (if not first note) */}
             {technique && (
-              <View style={[styles.techniqueBridge, { backgroundColor: noteColor }]}>
+              <View style={[styles.techniqueBridge, { backgroundColor: stringColor }]}>
                 <Text style={styles.techniqueText}>{technique}</Text>
               </View>
             )}
             {/* The note box */}
-            <View style={[
-              styles.noteBar, 
-              { 
-                backgroundColor: noteColor, 
-                borderColor: borderColor,
-                width: noteWidth - (hasNextLink ? TECHNIQUE_BRIDGE_WIDTH / 2 : 0) 
-              }
-            ]}>
+            <View style={[styles.noteBar, { backgroundColor: stringColor, width: noteWidth - (hasNextLink ? TECHNIQUE_BRIDGE_WIDTH / 2 : 0) }]}>
               <Text style={styles.fretText}>{note.fret}</Text>
             </View>
           </React.Fragment>
@@ -225,82 +183,203 @@ const AnimatedNote = React.memo(({
       })}
     </Animated.View>
   );
-}, (prevProps, nextProps) => {
-  // Custom comparison - always re-render when noteStatuses changes
-  if (prevProps.noteStatuses !== nextProps.noteStatuses) {
-    return false; // Return false to trigger re-render
-  }
-  return prevProps.chainData === nextProps.chainData;
-});
+};
 
 export default function PlayalongScreen(): React.JSX.Element {
   const navigation = useNavigation<NavigationProp>();
   const route = useRoute<PlayalongRouteProp>();
   const { song } = route.params;
-  
-  const activeNoteIndex = useSharedValue(0);
-  const triggeredNotesRef = useRef<Set<string>>(new Set());
-  const triggerNotesAtBeatRef = useRef<((beat: number) => void) | null>(null);
-  const isPlayingRef = useRef(false); // Sync ref for JS callbacks to check
-  
-  // Pitch detection state
-  const [isPitchDetectionActive, setIsPitchDetectionActive] = useState(false);
-  const [lastDetectedNote, setLastDetectedNote] = useState<number | null>(null);
-  const [hitCount, setHitCount] = useState(0);
-  const [noteStatuses, setNoteStatuses] = useState<Record<string, 'hit' | 'miss' | null>>({});
-  const processedNotesRef = useRef<Set<string>>(new Set()); // Track which notes were already processed
-  
-  // Debug: log noteStatuses changes
-  useEffect(() => {
-    const entries = Object.entries(noteStatuses);
-    if (entries.length > 0) {
-      console.log('[NoteStatuses] Updated:', JSON.stringify(noteStatuses));
+
+  const isSongData = (value: Song | SongData): value is SongData => {
+    return 'metadata' in value && 'timing' in value;
+  };
+
+  const songTitle = isSongData(song) ? song.metadata.title : song.name;
+  const songBpm = isSongData(song) ? song.metadata.bpm : song.bpm;
+  const beatsPerBar = isSongData(song) ? song.metadata.beatsPerBar : song.beatsPerBar || 4;
+  const beatsPerMs = songBpm / 60000;
+
+  const engineSong = useMemo((): Song => {
+    if (!isSongData(song)) {
+      return song;
     }
-  }, [noteStatuses]);
+
+    const allEvents: GuitarEvent[] = [
+      ...song.tracks.lead,
+      ...(song.tracks.rhythm || []),
+      ...(song.tracks.bass || []),
+    ];
+
+    const tracks = Array.from({ length: 6 }, (_, idx) => ({
+      string: idx + 1,
+      notes: [] as Note[],
+    }));
+
+    for (const event of allEvents) {
+      const stringNumber = Math.max(1, Math.min(6, event.s + 1));
+      const mappedLink = event.acc === 's' ? '/' : event.acc;
+      tracks[stringNumber - 1].notes.push({
+        beat: event.t * beatsPerMs,
+        fret: event.f,
+        len: Math.max(event.d * beatsPerMs, 0.05),
+        string: stringNumber,
+        linkNext: mappedLink === 'h' || mappedLink === 'p' || mappedLink === '/' ? mappedLink : undefined,
+      });
+    }
+
+    for (const track of tracks) {
+      track.notes.sort((a, b) => a.beat - b.beat);
+    }
+
+    return {
+      id: song.metadata.id,
+      name: song.metadata.title,
+      bpm: song.metadata.bpm,
+      beatsPerBar: song.metadata.beatsPerBar || 4,
+      lastModified: Date.now(),
+      tracks,
+    };
+  }, [song, beatsPerMs]);
   
-  const [isPlaying, setIsPlaying] = useState(false);
+  // Use the gameplay engine hook for audio management
+  const {
+    isPlaying,
+    togglePlayback,
+    setPlaybackSpeed: setEnginePlaybackSpeed,
+    seekByMs,
+    playbackSpeed,
+    currentTimeMs,
+    currentBeat,
+    songDurationMs,
+    isReady,
+    error: engineError,
+  } = useGameplayEngine(engineSong);
+  
   const [hasEnded, setHasEnded] = useState(false);
-  const [playbackSpeed, setPlaybackSpeed] = useState(100); // 25-125%, 100 = normal speed
-  const playbackSpeedMultiplier = useSharedValue(1.0); // For worklet access
-  const currentTimeMs = useSharedValue(0);
-  const lastFrameTime = useSharedValue(0);
-  const songEndedRef = useSharedValue(false);
+  const [seekFeedback, setSeekFeedback] = useState<{ side: 'left' | 'right'; label: string } | null>(null);
   const topBarOffset = useSharedValue(0); // For sliding top bar animation
+  const songEndedRef = useRef(false);
+  const seekFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const singleTapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastTapRef = useRef<{ side: 'left' | 'right' | null; ts: number }>({ side: null, ts: 0 });
 
   // BPM to beats conversion: beats = time(ms) * (BPM / 60000)
-  const beatsPerMs = song.bpm / 60000;
+
+  const visualNotes = useMemo((): VisualNote[] => {
+    if (isSongData(song)) {
+      const allEvents: GuitarEvent[] = [
+        ...song.tracks.lead,
+        ...(song.tracks.rhythm || []),
+        ...(song.tracks.bass || []),
+      ];
+
+      return allEvents
+        .map((event) => {
+          const stringNumber = Math.max(1, Math.min(6, event.s + 1));
+          const mappedLink = event.acc === 's' ? '/' : event.acc;
+          const linkNext: VisualNote['linkNext'] =
+            mappedLink === 'h' || mappedLink === 'p' || mappedLink === '/'
+              ? mappedLink
+              : undefined;
+          return {
+            beat: event.t * beatsPerMs,
+            len: Math.max(event.d * beatsPerMs, 0.05),
+            fret: event.f,
+            string: stringNumber,
+            stringY: getStringY(stringNumber),
+            stringNumber,
+            linkNext,
+          };
+        })
+        .sort((a, b) => a.beat - b.beat);
+    }
+
+    const notes: VisualNote[] = [];
+    for (const track of song.tracks) {
+      const trackStringY = getStringY(track.string);
+      for (const note of track.notes) {
+        notes.push({
+          beat: note.beat,
+          len: note.len,
+          fret: note.fret,
+          string: track.string,
+          stringY: trackStringY,
+          stringNumber: track.string,
+          linkNext: note.linkNext,
+        });
+      }
+    }
+    return notes.sort((a, b) => a.beat - b.beat);
+  }, [song, beatsPerMs]);
 
   // Calculate total song duration in beats (find the last note end)
   const songDurationBeats = useMemo(() => {
     let maxBeat = 0;
-    for (const track of song.tracks) {
-      for (const note of track.notes) {
-        const noteEnd = note.beat + note.len;
-        if (noteEnd > maxBeat) {
-          maxBeat = noteEnd;
-        }
+    for (const note of visualNotes) {
+      const noteEnd = note.beat + note.len;
+      if (noteEnd > maxBeat) {
+        maxBeat = noteEnd;
       }
     }
     // Add buffer after the last note for final bounce (4 beats)
     return maxBeat + 4;
-  }, [song]);
+  }, [visualNotes]);
 
-  // Derived value for current beat
-  const currentBeat = useDerivedValue(() => {
-    return currentTimeMs.value * beatsPerMs;
-  });
+  const visualDurationMs = useMemo(() => {
+    return songDurationBeats / beatsPerMs;
+  }, [songDurationBeats, beatsPerMs]);
 
   const handleSongEnd = useCallback(() => {
-    if (!hasEnded) {
+    if (!songEndedRef.current) {
+      songEndedRef.current = true;
       setHasEnded(true);
-      setIsPlaying(false);
       navigation.goBack();
     }
-  }, [navigation, hasEnded]);
+  }, [navigation]);
 
-  const togglePlayback = useCallback(() => {
-    setIsPlaying(prev => !prev);
+  const showSeekFeedback = useCallback((side: 'left' | 'right', label: string) => {
+    setSeekFeedback({ side, label });
+    if (seekFeedbackTimerRef.current) {
+      clearTimeout(seekFeedbackTimerRef.current);
+    }
+    seekFeedbackTimerRef.current = setTimeout(() => {
+      setSeekFeedback(null);
+      seekFeedbackTimerRef.current = null;
+    }, SEEK_INDICATOR_VISIBLE_MS);
   }, []);
+
+  const performSeek = useCallback((direction: 1 | -1) => {
+    if (!isReady) return;
+
+    const deltaMs = direction * SEEK_STEP_MS;
+    seekByMs(deltaMs);
+
+    showSeekFeedback(direction < 0 ? 'left' : 'right', direction < 0 ? '<< 5s' : '5s >>');
+  }, [isReady, seekByMs, showSeekFeedback]);
+
+  const handlePlayAreaPress = useCallback((event: GestureResponderEvent) => {
+    const isLeftSide = event.nativeEvent.locationX < (SCREEN_WIDTH / 2);
+    const side: 'left' | 'right' = isLeftSide ? 'left' : 'right';
+    const now = Date.now();
+    const isDoubleTap = lastTapRef.current.side === side && (now - lastTapRef.current.ts) <= DOUBLE_TAP_WINDOW_MS;
+
+    if (singleTapTimerRef.current) {
+      clearTimeout(singleTapTimerRef.current);
+      singleTapTimerRef.current = null;
+    }
+
+    if (isDoubleTap) {
+      performSeek(side === 'left' ? -1 : 1);
+      lastTapRef.current = { side: null, ts: 0 };
+      return;
+    }
+
+    lastTapRef.current = { side, ts: now };
+    singleTapTimerRef.current = setTimeout(() => {
+      togglePlayback();
+      singleTapTimerRef.current = null;
+    }, DOUBLE_TAP_WINDOW_MS);
+  }, [performSeek, togglePlayback]);
 
   // Animate top bar slide up/down based on playing state
   useEffect(() => {
@@ -316,18 +395,14 @@ export default function PlayalongScreen(): React.JSX.Element {
 
   // Handle playback speed change with buttons
   const handleSpeedChange = useCallback((delta: number) => {
-    setPlaybackSpeed(prev => {
-      const newSpeed = Math.max(25, Math.min(125, prev + delta));
-      playbackSpeedMultiplier.value = newSpeed / 100;
-      return newSpeed;
-    });
-  }, [playbackSpeedMultiplier]);
+    const newSpeed = Math.max(25, Math.min(125, playbackSpeed + delta));
+    setEnginePlaybackSpeed(newSpeed);
+  }, [playbackSpeed, setEnginePlaybackSpeed]);
 
   // Reset speed to 100%
   const handleSpeedReset = useCallback(() => {
-    setPlaybackSpeed(100);
-    playbackSpeedMultiplier.value = 1.0;
-  }, [playbackSpeedMultiplier]);
+    setEnginePlaybackSpeed(100);
+  }, [setEnginePlaybackSpeed]);
 
   // Long press acceleration for speed buttons
   const longPressInterval = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -375,88 +450,51 @@ export default function PlayalongScreen(): React.JSX.Element {
       if (longPressInterval.current) {
         clearInterval(longPressInterval.current);
       }
+      if (seekFeedbackTimerRef.current) {
+        clearTimeout(seekFeedbackTimerRef.current);
+      }
+      if (singleTapTimerRef.current) {
+        clearTimeout(singleTapTimerRef.current);
+      }
     };
   }, []);
 
-  // Initialize audio on mount
+  // Keep end handling in JS, but source-of-truth remains native audio position.
   useEffect(() => {
-    initAudio();
-    return () => {
-      stopAllSounds();
-      unloadAllSamples();
-    };
-  }, []);
+    if (hasEnded || !isPlaying) return;
 
-  // Keep isPlayingRef in sync with isPlaying state (for JS callbacks to check)
-  useEffect(() => {
-    isPlayingRef.current = isPlaying;
-    // Stop any playing sounds when pausing (but don't clear triggered set to avoid race condition)
-    if (!isPlaying) {
-      stopAllSounds();
-    }
-    
-    // Start/stop pitch detection with playback
-    if (isPlaying) {
-      // Start pitch detection asynchronously
-      startPitchDetection().then((started) => {
-        console.log('Pitch detection started result:', started);
-        setIsPitchDetectionActive(started);
-      });
-    } else {
-      stopPitchDetection();
-      setIsPitchDetectionActive(false);
-    }
-  }, [isPlaying]);
+    const endThresholdMs = songDurationMs - 30;
+    const interval = setInterval(() => {
+      if (!songEndedRef.current && currentTimeMs.value >= endThresholdMs) {
+        handleSongEnd();
+      }
+    }, 50);
 
-  // Wrapper function that calls through ref (for runOnJS to call from worklet)
-  const triggerAudioAtBeat = useCallback((beat: number) => {
-    triggerNotesAtBeatRef.current?.(beat);
-  }, []);
-
-  // Frame callback for smooth animation
-  useFrameCallback((frameInfo) => {
-    if (!isPlaying || songEndedRef.value) {
-      lastFrameTime.value = frameInfo.timestamp;
-      return;
-    }
-
-    const delta = frameInfo.timestamp - lastFrameTime.value;
-    lastFrameTime.value = frameInfo.timestamp;
-    // Multiply delta by playback speed multiplier (0.25 to 1.25)
-    currentTimeMs.value += delta * playbackSpeedMultiplier.value;
-
-    // Check if song has ended
-    const currentBeatValue = currentTimeMs.value * beatsPerMs;
-    
-    // Trigger audio for notes at current beat (via ref to avoid hook ordering issues)
-    runOnJS(triggerAudioAtBeat)(currentBeatValue);
-    
-    if (currentBeatValue >= songDurationBeats && !songEndedRef.value) {
-      songEndedRef.value = true;
-      runOnJS(handleSongEnd)();
-    }
-  }, true);
+    return () => clearInterval(interval);
+  }, [currentTimeMs, handleSongEnd, hasEnded, isPlaying, songDurationMs]);
 
   // Calculate Y position for each string
-  const getStringY = (stringNumber: number): number => {
+  function getStringY(stringNumber: number): number {
     return STRING_AREA_TOP + (stringNumber - 1) * STRING_SPACING;
-  };
+  }
 
   // Prepare all linked note chains (memoized)
   const allNoteChains = useMemo((): LinkedNoteChain[] => {
     const chains: LinkedNoteChain[] = [];
-    
-    for (const track of song.tracks) {
-      // Sort notes by beat position
-      const sortedNotes = [...track.notes].sort((a, b) => a.beat - b.beat);
+
+    const notesByString = new Map<number, VisualNote[]>();
+    for (let stringNumber = 1; stringNumber <= 6; stringNumber++) {
+      notesByString.set(stringNumber, visualNotes.filter((note) => note.stringNumber === stringNumber));
+    }
+
+    for (const [stringNumber, stringNotes] of notesByString) {
+      const sortedNotes = [...stringNotes].sort((a, b) => a.beat - b.beat);
       const processedIndices = new Set<number>();
       
       for (let i = 0; i < sortedNotes.length; i++) {
         if (processedIndices.has(i)) continue;
         
-        const chainNotes: Note[] = [sortedNotes[i]];
-        // Use string + beat as unique ID (consistent with audioNotes)
-        const chainNoteIds: string[] = [`${track.string}_${sortedNotes[i].beat}`];
+        const chainNotes: VisualNote[] = [sortedNotes[i]];
         const techniques: ('h' | 'p' | '/')[] = [];
         let currentIndex = i;
         
@@ -465,7 +503,6 @@ export default function PlayalongScreen(): React.JSX.Element {
           techniques.push(sortedNotes[currentIndex].linkNext!);
           currentIndex++;
           chainNotes.push(sortedNotes[currentIndex]);
-          chainNoteIds.push(`${track.string}_${sortedNotes[currentIndex].beat}`);
           processedIndices.add(currentIndex);
         }
         
@@ -478,10 +515,9 @@ export default function PlayalongScreen(): React.JSX.Element {
         
         chains.push({
           notes: chainNotes,
-          noteIds: chainNoteIds,
           techniques,
-          stringNumber: track.string,
-          y: getStringY(track.string),
+          stringNumber,
+          y: getStringY(stringNumber),
           startBeat: firstNote.beat,
           totalDuration,
         });
@@ -489,253 +525,125 @@ export default function PlayalongScreen(): React.JSX.Element {
     }
     
     return chains;
-  }, [song]);
+  }, [visualNotes]);
 
-  // Prepare sorted flat notes for ball animation
+  // Prepare sorted flat notes for ball animation.
+  // When multiple notes share the same beat (chords), keep only the
+  // topmost string (smallest stringY) so the ball doesn't teleport
+  // between simultaneous notes.
   const sortedFlatNotes = useMemo(() => {
-    const notes: (Note & { stringY: number; stringNumber: number })[] = [];
-    for (const track of song.tracks) {
-      const trackStringY = getStringY(track.string);
-      for (const note of track.notes) {
-        notes.push({ ...note, stringY: trackStringY, stringNumber: track.string });
+    const sorted = [...visualNotes].sort((a, b) => a.beat - b.beat);
+    if (sorted.length === 0) return sorted;
+
+    const merged: VisualNote[] = [sorted[0]];
+    for (let i = 1; i < sorted.length; i++) {
+      const prev = merged[merged.length - 1];
+      // Treat notes within 0.01 beats as simultaneous (same chord)
+      if (Math.abs(sorted[i].beat - prev.beat) < 0.01) {
+        // Keep the note on the topmost string (smallest stringY = highest on screen)
+        if (sorted[i].stringY < prev.stringY) {
+          merged[merged.length - 1] = sorted[i];
+        }
+        // Otherwise skip this note — prev is already the top one
+      } else {
+        merged.push(sorted[i]);
       }
     }
-    return notes.sort((a, b) => a.beat - b.beat);
-  }, [song]);
+    return merged;
+  }, [visualNotes]);
 
-  // Prepare audio notes with technique info
-  const audioNotes = useMemo((): AudioNote[] => {
-    const notes: AudioNote[] = [];
-    
-    for (const track of song.tracks) {
-      const sortedTrackNotes = [...track.notes].sort((a, b) => a.beat - b.beat);
-      
-      for (let i = 0; i < sortedTrackNotes.length; i++) {
-        const note = sortedTrackNotes[i];
-        const prevNote = i > 0 ? sortedTrackNotes[i - 1] : null;
-        
-        // Determine if this note is reached via a technique
-        let technique: 'h' | 'p' | '/' | null = null;
-        if (prevNote && prevNote.linkNext) {
-          technique = prevNote.linkNext;
-        }
-        
-        // For slides, we need the next fret
-        let nextFret: number | undefined;
-        if (note.linkNext === '/' && i + 1 < sortedTrackNotes.length) {
-          nextFret = sortedTrackNotes[i + 1].fret;
-        }
-        
-        // Use string + beat as unique ID (matches allNoteChains)
-        notes.push({
-          id: `${track.string}_${note.beat}`,
-          beat: note.beat,
-          stringNumber: track.string,
-          fret: note.fret,
-          len: note.len,
-          technique,
-          nextFret,
-        });
-      }
+  // Pre-calculate the entire bounce path so the UI thread only does array lookup.
+  const bounceMap = useMemo(() => {
+    const totalFrames = Math.max(2, Math.ceil(visualDurationMs / BOUNCE_FRAME_DURATION_MS) + 1);
+    const map = new Float32Array(totalFrames);
+
+    if (sortedFlatNotes.length === 0) {
+      map.fill(STRING_AREA_TOP - NOTE_TOP_OFFSET);
+      return map;
     }
-    
-    return notes.sort((a, b) => a.beat - b.beat);
-  }, [song]);
 
-  // Debug: Log all note IDs to verify they match between allNoteChains and audioNotes
-  useEffect(() => {
-    const chainNoteIds = allNoteChains.flatMap(chain => chain.noteIds);
-    const audioNoteIds = audioNotes.map(n => n.id);
-    console.log('[DEBUG] Chain Note IDs:', chainNoteIds.slice(0, 5));
-    console.log('[DEBUG] Audio Note IDs:', audioNoteIds.slice(0, 5));
-    
-    // Check for mismatches
-    const chainSet = new Set(chainNoteIds);
-    const audioSet = new Set(audioNoteIds);
-    const inChainNotAudio = chainNoteIds.filter(id => !audioSet.has(id));
-    const inAudioNotChain = audioNoteIds.filter(id => !chainSet.has(id));
-    if (inChainNotAudio.length > 0) console.log('[DEBUG] In chain but not audio:', inChainNotAudio);
-    if (inAudioNotChain.length > 0) console.log('[DEBUG] In audio but not chain:', inAudioNotChain);
-  }, [allNoteChains, audioNotes]);
+    let noteIdx = 0;
 
-  // Convert string/fret to MIDI note number
-  const stringFretToMidi = useCallback((stringNum: number, fret: number): number => {
-    // Guitar standard tuning: String 1 = E4(64), String 6 = E2(40)
-    const baseNotes = [64, 59, 55, 50, 45, 40]; // E4, B3, G3, D3, A2, E2
-    return baseNotes[stringNum - 1] + fret;
-  }, []);
+    for (let i = 0; i < totalFrames; i++) {
+      const sampleTimeMs = i * BOUNCE_FRAME_DURATION_MS;
+      const beat = sampleTimeMs * beatsPerMs;
 
-  // Get expected note at current beat position
-  const getExpectedNoteAtBeat = useCallback((beat: number): { midi: number; noteId: string } | null => {
-    for (const audioNote of audioNotes) {
-      // Check if this note is within the hit window
-      const noteStart = audioNote.beat;
-      const noteEnd = audioNote.beat + audioNote.len;
-      
-      if (beat >= noteStart - HIT_WINDOW_BEATS && beat <= noteEnd + HIT_WINDOW_BEATS) {
-        const midi = stringFretToMidi(audioNote.stringNumber, audioNote.fret);
-        return { midi, noteId: audioNote.id };
+      while (noteIdx < sortedFlatNotes.length - 1 && beat > sortedFlatNotes[noteIdx + 1].beat) {
+        noteIdx++;
       }
+
+      const currentNote = sortedFlatNotes[noteIdx];
+      const nextNote = sortedFlatNotes[noteIdx + 1];
+
+      if (noteIdx === 0 && beat < sortedFlatNotes[0].beat) {
+        const firstBeat = Math.max(sortedFlatNotes[0].beat, 0.0001);
+        const progress = beat / firstBeat;
+        const clampedProgress = Math.max(0, Math.min(1, progress));
+        const jumpOffset = 4 * MAX_BOUNCE_Y * clampedProgress * (1 - clampedProgress);
+        map[i] = sortedFlatNotes[0].stringY - NOTE_TOP_OFFSET - jumpOffset;
+        continue;
+      }
+
+      if (!nextNote) {
+        const remainingBeats = songDurationBeats - currentNote.beat;
+        if (remainingBeats <= 0) {
+          map[i] = currentNote.stringY - NOTE_TOP_OFFSET;
+          continue;
+        }
+        const progress = (beat - currentNote.beat) / remainingBeats;
+        const clampedProgress = Math.max(0, Math.min(1, progress));
+        const jumpOffset = 4 * MAX_BOUNCE_Y * clampedProgress * (1 - clampedProgress);
+        map[i] = currentNote.stringY - NOTE_TOP_OFFSET - jumpOffset;
+        continue;
+      }
+
+      const gap = nextNote.beat - currentNote.beat;
+      const safeGap = Math.max(gap, 0.0001);
+      const progress = (beat - currentNote.beat) / safeGap;
+      const clampedProgress = Math.max(0, Math.min(1, progress));
+
+      let availableRoom = currentNote.stringY - NOTE_TOP_OFFSET - MAX_BOUNCE_Y;
+      if (currentNote.stringNumber === 1) {
+        availableRoom *= 2;
+      }
+      const targetHeight = Math.max(MIN_BOUNCE_V, (safeGap / 4) * availableRoom);
+      const finalHeight = Math.min(targetHeight, availableRoom);
+
+      const jumpOffset = 4 * finalHeight * clampedProgress * (1 - clampedProgress);
+      const lerpY = currentNote.stringY + (nextNote.stringY - currentNote.stringY) * clampedProgress;
+
+      map[i] = lerpY - NOTE_TOP_OFFSET - jumpOffset;
     }
-    return null;
-  }, [audioNotes, stringFretToMidi]);
 
-  // Pitch detection listener
-  useEffect(() => {
-    const subscription = addPitchDetectionListener((event) => {
-      const { note: detectedMidi, probability } = event;
-      
-      console.log('[PitchDetect] Received event:', detectedMidi, 'prob:', probability);
-      setLastDetectedNote(detectedMidi);
-      
-      // Get current beat position
-      const currentBeatValue = currentTimeMs.value * beatsPerMs;
-      
-      // Find expected note at current beat
-      const expected = getExpectedNoteAtBeat(currentBeatValue);
-      console.log('[PitchDetect] Beat:', currentBeatValue.toFixed(2), 'Expected:', expected);
-      
-      if (expected) {
-        // Check if we already processed this note
-        if (processedNotesRef.current.has(expected.noteId)) {
-          return; // Already processed
-        }
-        
-        // Check if detected note matches expected (within tolerance)
-        const diff = Math.abs(detectedMidi - expected.midi);
-        console.log('[PitchDetect] Detected MIDI:', detectedMidi, 'Expected MIDI:', expected.midi, 'Diff:', diff);
-        
-        if (diff <= PITCH_MATCH_TOLERANCE) {
-          // HIT!
-          console.log('[PitchDetect] HIT! NoteId:', expected.noteId);
-          processedNotesRef.current.add(expected.noteId);
-          setHitCount(prev => prev + 1);
-          setNoteStatuses(prev => ({ ...prev, [expected.noteId]: 'hit' }));
-        } else {
-          // MISS - wrong note played (but only mark once)
-          console.log('[PitchDetect] MISS! NoteId:', expected.noteId);
-          processedNotesRef.current.add(expected.noteId);
-          setNoteStatuses(prev => ({ ...prev, [expected.noteId]: 'miss' }));
-        }
-      }
-    });
-    
-    return () => {
-      subscription.remove();
-    };
-  }, [beatsPerMs, getExpectedNoteAtBeat]);
+    return map;
+  }, [sortedFlatNotes, beatsPerMs, songDurationBeats, visualDurationMs]);
 
-  // Store playback speed in ref for JS thread access
-  const playbackSpeedRef = useRef(1.0);
-  useEffect(() => {
-    playbackSpeedRef.current = playbackSpeed / 100;
-  }, [playbackSpeed]);
-
-  // Trigger audio for notes that have just been reached
-  const triggerNotesAtBeat = useCallback((currentBeatValue: number) => {
-    // Don't trigger if not playing (prevents race condition when pausing)
-    if (!isPlayingRef.current) return;
-    
-    try {
-      for (const note of audioNotes) {
-        // Check if we've just passed this note's beat and haven't triggered it yet
-        if (note.beat <= currentBeatValue && !triggeredNotesRef.current.has(note.id)) {
-          // Mark as triggered
-          triggeredNotesRef.current.add(note.id);
-          
-          if (note.technique === null) {
-            // Normal picked note
-            playNote(note.stringNumber, note.fret);
-          } else if (note.technique === 'h' || note.technique === 'p') {
-            // Hammer-on or pull-off
-            playLegato(note.stringNumber, note.fret, note.technique);
-          }
-          // Note: slides TO are handled by the previous note's slide
-          
-          // If this note starts a slide, play the slide
-          if (note.nextFret !== undefined) {
-            playSlide(note.stringNumber, note.fret, note.nextFret);
-          }
-        }
-      }
-    } catch (error) {
-      console.warn('Error triggering audio:', error);
-    }
-  }, [audioNotes]);
-  
-  // Update the ref whenever the callback changes
-  useEffect(() => {
-    triggerNotesAtBeatRef.current = triggerNotesAtBeat;
-  }, [triggerNotesAtBeat]);
-
-  // Ball Y position calculation
+  // Ball Y position lookup with frame interpolation for high refresh-rate displays.
   const ballY = useDerivedValue(() => {
-    const beat = currentBeat.value;
-    const notes = sortedFlatNotes;
-    const totalNotes = notes.length;
+    const mapLength = bounceMap.length;
+    if (mapLength === 0) return STRING_AREA_TOP - NOTE_TOP_OFFSET;
 
-    if (totalNotes === 0) return STRING_AREA_TOP;
+    const framePosition = currentTimeMs.value / BOUNCE_FRAME_DURATION_MS;
 
-    // O(1) INDEX TRACKING
-    let idx = activeNoteIndex.value;
-    while (idx < totalNotes - 1 && beat > notes[idx + 1].beat) {
-      idx++;
-    }
-    while (idx > 0 && beat < notes[idx].beat) {
-      idx--;
-    }
-    activeNoteIndex.value = idx;
+    if (framePosition <= 0) return bounceMap[0];
 
-    const currentNote = notes[idx];
-    const nextNote = notes[idx + 1];
+    const lastIndex = mapLength - 1;
+    if (framePosition >= lastIndex) return bounceMap[lastIndex];
 
-    if (idx === 0 && beat < notes[0].beat) {
-      // Bounce on the first note from the start
-      const progress = beat / notes[0].beat;
-      const clampedProgress = Math.max(0, Math.min(1, progress));
-      const jumpOffset = 4 * MAX_BOUNCE_Y * clampedProgress * (1 - clampedProgress);
-      return notes[0].stringY - NOTE_TOP_OFFSET - jumpOffset;
-    }
+    const lowerIndex = Math.floor(framePosition);
+    const upperIndex = Math.min(lowerIndex + 1, lastIndex);
+    const alpha = framePosition - lowerIndex;
+    const lowerValue = bounceMap[lowerIndex];
+    const upperValue = bounceMap[upperIndex];
 
-    // If we are at the end of the song
-    if (!nextNote) {
-      // Bounce on the last note with max height until the end
-      const remainingBeats = songDurationBeats - currentNote.beat;
-      if (remainingBeats <= 0) return currentNote.stringY - NOTE_TOP_OFFSET;
-      const progress = (beat - currentNote.beat) / remainingBeats;
-      const clampedProgress = Math.max(0, Math.min(1, progress));
-      const jumpOffset = 4 * MAX_BOUNCE_Y * clampedProgress * (1 - clampedProgress);
-      return currentNote.stringY - NOTE_TOP_OFFSET - jumpOffset;
-    }
-
-    // DYNAMIC HEIGHT CALCULATION
-    const gap = nextNote.beat - currentNote.beat;
-    const progress = (beat - currentNote.beat) / gap;
-    const clampedProgress = Math.max(0, Math.min(1, progress));
-
-    // Determine the dynamic height based on the gap
-    let availableRoom = currentNote.stringY - NOTE_TOP_OFFSET - MAX_BOUNCE_Y;
-    if (currentNote.stringNumber === 1) {
-      availableRoom *= 2; // Increase bounce height for the first string
-    }
-    const targetHeight = Math.max(MIN_BOUNCE_V, (gap / 4) * availableRoom);
-    const finalHeight = Math.min(targetHeight, availableRoom);
-
-    // PARABOLIC JUMP
-    const jumpOffset = 4 * finalHeight * clampedProgress * (1 - clampedProgress);
-
-    // Linear Y interpolation
-    const lerpY = currentNote.stringY + (nextNote.stringY - currentNote.stringY) * clampedProgress;
-
-    return lerpY - NOTE_TOP_OFFSET - jumpOffset;
-  });
+    return lowerValue + ((upperValue - lowerValue) * alpha);
+  }, [bounceMap]);
 
   // Calculate bar numbers to render (memoized)
   const barNumbers = useMemo((): number[] => {
-    const beatsPerBar = song.beatsPerBar || 4; // Default to 4/4 if not specified
     const totalBars = Math.ceil(songDurationBeats / beatsPerBar);
     return Array.from({ length: totalBars + 1 }, (_, i) => i);
-  }, [song.beatsPerBar, songDurationBeats]);
+  }, [beatsPerBar, songDurationBeats]);
 
   // Total strings height for bar lines
   const totalStringsHeight = 5 * STRING_SPACING;
@@ -747,14 +655,14 @@ export default function PlayalongScreen(): React.JSX.Element {
         <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backButton}>
           <Text style={styles.backButtonText}>← Back</Text>
         </TouchableOpacity>
-        <Text style={styles.songTitle} numberOfLines={1}>{song.name}</Text>
-        <Text style={styles.bpmText}>{song.bpm} BPM</Text>
+        <Text style={styles.songTitle} numberOfLines={1}>{songTitle}</Text>
+        <Text style={styles.bpmText}>{songBpm} BPM</Text>
       </Animated.View>
 
       {/* Playalong Area */}
       <TouchableOpacity 
         style={styles.playArea} 
-        onPress={togglePlayback}
+        onPress={handlePlayAreaPress}
         activeOpacity={1}
       >
         {/* Floating Speed Control - Top Right */}
@@ -822,7 +730,7 @@ export default function PlayalongScreen(): React.JSX.Element {
             <AnimatedBarLine
               key={`bar-${barNumber}`}
               barNumber={barNumber}
-              beatsPerBar={song.beatsPerBar || 4}
+              beatsPerBar={beatsPerBar}
               currentBeat={currentBeat}
               stringAreaTop={STRING_AREA_TOP}
               totalStringsHeight={totalStringsHeight}
@@ -837,7 +745,6 @@ export default function PlayalongScreen(): React.JSX.Element {
               key={`chain-${chainData.stringNumber}-${chainData.startBeat}-${index}`}
               chainData={chainData}
               currentBeat={currentBeat}
-              noteStatuses={noteStatuses}
             />
           ))}
         </View>
@@ -854,32 +761,21 @@ export default function PlayalongScreen(): React.JSX.Element {
           zIndex: 10,
         }))} />
 
-        {/* Pitch Detection Feedback - Bottom Left */}
-        {isPitchDetectionActive && (
-          <View style={styles.pitchFeedbackContainer}>
-            {/* Detected note display */}
-            <View style={styles.detectedNoteContainer}>
-              <Text style={styles.detectedNoteLabel}>Detected:</Text>
-              <Text style={styles.detectedNoteValue}>
-                {lastDetectedNote !== null ? `MIDI ${lastDetectedNote}` : '--'}
-              </Text>
-            </View>
-            
-            {/* Score */}
-            <View style={styles.scoreContainer}>
-              <Text style={styles.scoreText}>
-                Hits: {hitCount}
-              </Text>
-            </View>
-          </View>
-        )}
-
         {/* Play/Pause indicator */}
         <View style={styles.playIndicator}>
           <Text style={styles.playIndicatorText}>
             {isPlaying ? '⏸ Tap to Pause' : '▶ Tap to Play'}
           </Text>
         </View>
+
+        {seekFeedback && (
+          <View style={[
+            styles.seekIndicator,
+            seekFeedback.side === 'left' ? styles.seekIndicatorLeft : styles.seekIndicatorRight,
+          ]}>
+            <Text style={styles.seekIndicatorText}>{seekFeedback.label}</Text>
+          </View>
+        )}
       </TouchableOpacity>
     </View>
   );
@@ -1049,40 +945,25 @@ const styles = StyleSheet.create({
     fontSize: 18,
     fontWeight: '500',
   },
-  // Pitch detection feedback styles
-  pitchFeedbackContainer: {
+  seekIndicator: {
     position: 'absolute',
-    bottom: 80,
-    left: 10,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-    backgroundColor: 'rgba(15, 52, 96, 0.9)',
-    borderRadius: 12,
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    zIndex: 100,
+    top: '42%',
+    backgroundColor: 'rgba(15, 52, 96, 0.88)',
+    borderRadius: 24,
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderWidth: 1,
+    borderColor: '#e94560',
   },
-  detectedNoteContainer: {
-    alignItems: 'center',
+  seekIndicatorLeft: {
+    left: 28,
   },
-  detectedNoteLabel: {
-    color: '#888',
-    fontSize: 10,
+  seekIndicatorRight: {
+    right: 28,
   },
-  detectedNoteValue: {
+  seekIndicatorText: {
     color: '#fff',
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  scoreContainer: {
-    paddingLeft: 10,
-    borderLeftWidth: 1,
-    borderLeftColor: '#444',
-  },
-  scoreText: {
-    color: '#2ecc71',
-    fontSize: 14,
-    fontWeight: 'bold',
+    fontSize: 18,
+    fontWeight: '700',
   },
 });

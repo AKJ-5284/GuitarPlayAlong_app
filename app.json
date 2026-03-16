@@ -6,7 +6,10 @@
     "orientation": "landscape",
     "userInterfaceStyle": "dark",
     "newArchEnabled": true,
+    "icon": "./assets/icon.png",
     "splash": {
+      "image": "./assets/icon.png",
+      "resizeMode": "contain",
       "backgroundColor": "#1a1a2e"
     },
     "ios": {
@@ -14,7 +17,11 @@
       "bundleIdentifier": "com.guitarplayalong.app"
     },
     "android": {
-      "package": "com.guitarplayalong.app"
+      "package": "com.guitarplayalong.app",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#1a1a2e"
+      }
     },
     "web": {
       "bundler": "metro"

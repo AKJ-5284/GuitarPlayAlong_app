@@ -1,10 +1,6 @@
-import { Platform, NativeEventEmitter, NativeModules, PermissionsAndroid } from 'react-native';
-import { EventEmitter } from 'expo-modules-core';
+import { Platform } from 'react-native';
 import ExpoFluidsynth from '../../modules/expo-fluidsynth';
-import { Song } from '../types/song';
-
-// Event emitter for pitch detection events
-const pitchEventEmitter = new EventEmitter(ExpoFluidsynth as any);
+import { Song, SongData } from '../types/song';
 
 // FluidSynth initialization state
 let fluidsynthInitialized = false;
@@ -18,6 +14,10 @@ const LEGATO_PULL_VELOCITY = 65;
 
 // SoundFont filename
 const SOUNDFONT_FILENAME = 'guitar.sf2';
+
+const isSongData = (value: Song | SongData): value is SongData => {
+  return 'metadata' in value && 'timing' in value;
+};
 
 /**
  * Get the SoundFont file path.
@@ -78,7 +78,7 @@ export async function initAudio(): Promise<void> {
     const result = await ExpoFluidsynth.initSynth(
       soundfontPath,
       44100, // Sample rate
-      5.0    // Gain (0.0 - 10.0)
+      1.4    // Gain (0.0 - 10.0)
     );
     
     if (result.success) {
@@ -111,13 +111,14 @@ export function isAudioReady(): boolean {
  * With FluidSynth, no preloading is needed - all notes are synthesized on demand.
  * This function is kept for API compatibility.
  */
-export async function preloadSamplesForSong(song: Song): Promise<void> {
+export async function preloadSamplesForSong(song: Song | SongData): Promise<void> {
   // FluidSynth doesn't need preloading - it synthesizes notes on demand
   // Just ensure FluidSynth is initialized
   if (!fluidsynthInitialized) {
     await initAudio();
   }
-  console.log(`FluidSynth ready for song: ${song.name} (no preloading needed)`);
+  const songTitle = isSongData(song) ? song.metadata.title : song.name;
+  console.log(`FluidSynth ready for song: ${songTitle} (no preloading needed)`);
 }
 
 /**
@@ -273,80 +274,4 @@ export async function cleanup(): Promise<void> {
   } catch (e) {
     console.error('Error cleaning up FluidSynth:', e);
   }
-}
-
-/**
- * Start pitch detection using the device microphone.
- * Requires RECORD_AUDIO permission on Android.
- * @returns Promise<true> if started successfully
- */
-export async function startPitchDetection(): Promise<boolean> {
-  if (Platform.OS !== 'android') {
-    console.warn('Pitch detection only available on Android');
-    return false;
-  }
-
-  try {
-    // Request microphone permission at runtime
-    console.log('Requesting microphone permission...');
-    const granted = await PermissionsAndroid.request(
-      PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
-      {
-        title: 'Microphone Permission',
-        message: 'GuitarPlayAlong needs microphone access to detect the notes you play.',
-        buttonNeutral: 'Ask Me Later',
-        buttonNegative: 'Cancel',
-        buttonPositive: 'OK',
-      },
-    );
-    
-    if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
-      console.warn('Microphone permission denied');
-      return false;
-    }
-    
-    console.log('Microphone permission granted, starting pitch detection...');
-    const result = ExpoFluidsynth.startPitchDetection();
-    console.log('Pitch detection started:', result);
-    return result;
-  } catch (e) {
-    console.error('Error starting pitch detection:', e);
-    return false;
-  }
-}
-
-/**
- * Stop pitch detection.
- * @returns true if stopped successfully
- */
-export function stopPitchDetection(): boolean {
-  if (Platform.OS !== 'android') {
-    return false;
-  }
-
-  try {
-    const result = ExpoFluidsynth.stopPitchDetection();
-    console.log('Pitch detection stopped:', result);
-    return result;
-  } catch (e) {
-    console.error('Error stopping pitch detection:', e);
-    return false;
-  }
-}
-
-/**
- * Add a listener for pitch detection events.
- * @param callback Called when a pitch is detected with {hz, note, probability}
- * @returns Subscription object with remove() method
- */
-export function addPitchDetectionListener(
-  callback: (event: { hz: number; note: number; probability: number }) => void
-): { remove: () => void } {
-  if (Platform.OS !== 'android') {
-    // Return a no-op subscription for non-Android platforms
-    return { remove: () => {} };
-  }
-
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return (pitchEventEmitter as any).addListener('onPitchDetected', callback);
 }

@@ -17,11 +17,42 @@ export type InitSynthOptions = {
   gain?: number;
 };
 
-export type PitchDetectedEvent = {
-  hz: number;
-  note: number;
-  probability: number;
+export type AudioPlaybackResult = {
+  success: boolean;
+  duration?: number;
+  speed?: number;
+  error?: string;
 };
+
+export type MidiPlaybackResult = {
+  success: boolean;
+  tempoMultiplier?: number;
+  error?: string;
+};
+
+export type AudioPlaybackCompleteEvent = {
+  filePath: string;
+};
+
+export type AudioPlaybackErrorEvent = {
+  error: string;
+  code: number;
+};
+
+export type MidiPlaybackCompleteEvent = {
+  filePath: string;
+};
+
+export type RenderSongResult = {
+  success: boolean;
+  path?: string;
+  durationMs?: number;
+  sizeBytes?: number;
+  error?: string;
+};
+
+// Note format for renderSongToWav: [timeMs, channel, midiNote, velocity, durationMs]
+export type NoteEvent = [number, number, number, number, number];
 
 export interface ExpoFluidsynthModule {
   isInitialized(): boolean;
@@ -36,7 +67,25 @@ export interface ExpoFluidsynthModule {
   allNotesOff(): boolean;
   selectProgram(channel: number, bank: number, preset: number): Promise<boolean>;
   setGain(gain: number): boolean;
-  startPitchDetection(): boolean;
-  stopPitchDetection(): boolean;
   cleanup(): Promise<boolean>;
+  
+  // Native Audio Player with Time-Stretching
+  loadAndPlayAudio(filePath: string, initialSpeed: number): Promise<AudioPlaybackResult>;
+  setPlaybackSpeed(speed: number): boolean;
+  pauseAudio(): boolean;
+  resumeAudio(): boolean;
+  stopAudio(): boolean;
+  seekAudio(positionMs: number): boolean;
+  getAudioPosition(): number;
+  getPlaybackSpeed(): number;
+  
+  // FluidSynth MIDI Player (Native Sequencer)
+  playMidiFile(filePath: string, tempoMultiplier: number): Promise<MidiPlaybackResult>;
+  setMidiTempo(tempoMultiplier: number): boolean;
+  stopMidiPlayback(): boolean;
+  seekMidi(ticks: number): boolean;
+  isMidiPlaying(): boolean;
+  
+  // Pre-render song to WAV file
+  renderSongToWav(notes: NoteEvent[], outputPath: string, durationMs: number): Promise<RenderSongResult>;
 }

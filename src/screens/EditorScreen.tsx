@@ -23,7 +23,7 @@ import Animated, {
   withSpring,
   runOnJS,
 } from 'react-native-reanimated';
-import { Song, Note } from '../types/song';
+import { Song, Note, SongData, GuitarEvent } from '../types/song';
 import {
   createNewSong,
   saveSong,
@@ -64,12 +64,58 @@ const STRING_COLORS = [
   '#e94560', '#f39c12', '#3498db', '#2ecc71', '#9b59b6', '#e74c3c',
 ];
 
+const isSongData = (value: Song | SongData): value is SongData => {
+  return 'metadata' in value && 'timing' in value;
+};
+
+const songDataToSong = (songData: SongData): Song => {
+  const msPerBeat = songData.timing.msPerBeat > 0
+    ? songData.timing.msPerBeat
+    : (60000 / songData.metadata.bpm);
+
+  const allEvents: GuitarEvent[] = [
+    ...songData.tracks.lead,
+    ...(songData.tracks.rhythm || []),
+    ...(songData.tracks.bass || []),
+  ];
+
+  const tracks = Array.from({ length: 6 }, (_, idx) => ({
+    string: idx + 1,
+    notes: [] as Note[],
+  }));
+
+  for (const event of allEvents) {
+    const stringNumber = Math.max(1, Math.min(6, event.s + 1));
+    const mappedLink = event.acc === 's' ? '/' : event.acc;
+    tracks[stringNumber - 1].notes.push({
+      beat: snapToGrid(event.t / msPerBeat),
+      fret: event.f,
+      len: Math.max(GRID_SNAP, snapToGrid(event.d / msPerBeat)),
+      string: stringNumber,
+      linkNext: mappedLink === 'h' || mappedLink === 'p' || mappedLink === '/' ? mappedLink : undefined,
+    });
+  }
+
+  for (const track of tracks) {
+    track.notes.sort((a, b) => a.beat - b.beat);
+  }
+
+  return {
+    id: songData.metadata.id,
+    name: songData.metadata.title,
+    bpm: songData.metadata.bpm,
+    beatsPerBar: songData.metadata.beatsPerBar || DEFAULT_BEATS_PER_BAR,
+    lastModified: Date.now(),
+    tracks,
+  };
+};
+
 // Note edit modal - inline component to avoid Modal presentation issues
 interface NoteEditModalProps {
   visible: boolean;
   note: Note | null;
   onClose: () => void;
-  onUpdate: (note: Note) => void;
+  onUpdate: (note: Note) => boolean;
   onDelete: () => void;
 }
 
@@ -145,7 +191,13 @@ function NoteEditModal({ visible, note, onClose, onUpdate, onDelete }: NoteEditM
           <TouchableOpacity style={styles.deleteButton} onPress={onDelete}>
             <Text style={styles.deleteButtonText}>Delete</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={styles.saveModalButton} onPress={() => { onUpdate(editedNote); onClose(); }}>
+          <TouchableOpacity
+            style={styles.saveModalButton}
+            onPress={() => {
+              const didUpdate = onUpdate(editedNote);
+              if (didUpdate) onClose();
+            }}
+          >
             <Text style={styles.saveButtonText}>Save</Text>
           </TouchableOpacity>
         </View>
@@ -321,16 +373,20 @@ function DraggableNote({ note, x, y, width, scrollOffset, onTap, onDragEnd }: Dr
 export default function EditorScreen(): React.JSX.Element {
   const navigation = useNavigation<NavigationProp>();
   const route = useRoute<EditorRouteProp>();
-  const passedSong = route.params?.song;
+  const passedSong = route.params?.song as Song | SongData | undefined;
+  const normalizedPassedSong = useMemo(() => {
+    if (!passedSong) return undefined;
+    return isSongData(passedSong) ? songDataToSong(passedSong) : passedSong;
+  }, [passedSong]);
   
   // Determine if this is a new song or editing existing
-  const isNewSong = !passedSong;
+  const isNewSong = !normalizedPassedSong;
   
   const [song, setSong] = useState<Song>(() => 
-    passedSong || createNewSong('New Song', 120, DEFAULT_BEATS_PER_BAR)
+    normalizedPassedSong || createNewSong('New Song', 120, DEFAULT_BEATS_PER_BAR)
   );
   const [originalSong, setOriginalSong] = useState<Song>(() => 
-    passedSong ? { ...passedSong } : createNewSong('New Song', 120, DEFAULT_BEATS_PER_BAR)
+    normalizedPassedSong ? { ...normalizedPassedSong } : createNewSong('New Song', 120, DEFAULT_BEATS_PER_BAR)
   );
   const [selectedNote, setSelectedNote] = useState<Note | null>(null);
   const [modalVisible, setModalVisible] = useState(false);
@@ -349,16 +405,16 @@ export default function EditorScreen(): React.JSX.Element {
   
   // Update song when navigated with a different song or reset to blank
   useEffect(() => {
-    if (passedSong) {
-      setSong(passedSong);
-      setOriginalSong({ ...passedSong });
-    } else if (passedSong === undefined && route.params !== undefined) {
+    if (normalizedPassedSong) {
+      setSong(normalizedPassedSong);
+      setOriginalSong({ ...normalizedPassedSong });
+    } else if (normalizedPassedSong === undefined && route.params !== undefined) {
       // Explicitly navigated with undefined song = create new blank song
       const newSong = createNewSong('New Song', 120, DEFAULT_BEATS_PER_BAR);
       setSong(newSong);
       setOriginalSong({ ...newSong });
     }
-  }, [passedSong, route.params]);
+  }, [normalizedPassedSong, route.params]);
   
   // Editing states for song name and BPM
   const [isEditingName, setIsEditingName] = useState(false);
@@ -469,14 +525,40 @@ export default function EditorScreen(): React.JSX.Element {
     return null;
   }, [song, getBeatFromX, getStringFromY]);
 
-  const handleNoteUpdate = useCallback((updatedNote: Note) => {
-    if (!selectedNote) return;
+  const hasStringOverlap = useCallback((candidate: Note, ignoreNote?: Note): boolean => {
+    const track = song.tracks.find(t => t.string === candidate.string);
+    if (!track) return false;
+
+    const candidateStart = candidate.beat;
+    const candidateEnd = candidate.beat + candidate.len;
+
+    return track.notes.some((existing) => {
+      if (ignoreNote && existing === ignoreNote) {
+        return false;
+      }
+
+      const existingStart = existing.beat;
+      const existingEnd = existing.beat + existing.len;
+      // Strict overlap check; touching boundaries is allowed.
+      return candidateStart < existingEnd && existingStart < candidateEnd;
+    });
+  }, [song]);
+
+  const handleNoteUpdate = useCallback((updatedNote: Note): boolean => {
+    if (!selectedNote) return false;
+
+    if (hasStringOverlap(updatedNote, selectedNote)) {
+      showToast('Cannot overlap notes on the same string');
+      return false;
+    }
+
     const updatedSong = { ...song };
     removeNoteFromSong(updatedSong, selectedNote);
     addNoteToSong(updatedSong, updatedNote);
     setSong(updatedSong);
     setSelectedNote(null);
-  }, [song, selectedNote]);
+    return true;
+  }, [song, selectedNote, hasStringOverlap, showToast]);
 
   const handleNoteDelete = useCallback(() => {
     if (!selectedNote) return;
@@ -498,23 +580,32 @@ export default function EditorScreen(): React.JSX.Element {
       const stringNum = getStringFromY(y);
       if (beat >= 0 && stringNum >= 1 && stringNum <= 6) {
         const newNote = createNote(beat, 0, stringNum, GRID_SNAP);
+        if (hasStringOverlap(newNote)) {
+          showToast('Cannot overlap notes on the same string');
+          return;
+        }
         const updatedSong = { ...song };
         addNoteToSong(updatedSong, newNote);
         setSong(updatedSong);
       }
     }
-  }, [scrollOffset, findNoteAtPosition, getBeatFromX, getStringFromY, song]);
+  }, [scrollOffset, findNoteAtPosition, getBeatFromX, getStringFromY, song, hasStringOverlap, showToast]);
 
   // Handle note drag completion
   const handleNoteDragEnd = useCallback((note: Note, newBeat: number, newString: number) => {
     if (newBeat === note.beat && newString === note.string) return;
+
+    const movedNote = { ...note, beat: newBeat, string: newString };
+    if (hasStringOverlap(movedNote, note)) {
+      showToast('Cannot overlap notes on the same string');
+      return;
+    }
     
     const updatedSong = { ...song };
     removeNoteFromSong(updatedSong, note);
-    const movedNote = { ...note, beat: newBeat, string: newString };
     addNoteToSong(updatedSong, movedNote);
     setSong(updatedSong);
-  }, [song]);
+  }, [song, hasStringOverlap, showToast]);
 
   // Handle note tap to open edit modal
   const handleNoteTap = useCallback((note: Note) => {

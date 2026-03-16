@@ -1,9 +1,67 @@
-import { Song } from '../types/song';
+import { Song, SongData, GuitarEvent } from '../types/song';
+
+const DEFAULT_TUNING = [64, 59, 55, 50, 45, 40];
+
+const midiToHz = (midiNote: number): number => {
+  return 440 * Math.pow(2, (midiNote - 69) / 12);
+};
+
+const mapLinkToAccent = (link?: 'h' | 'p' | '/'): GuitarEvent['acc'] => {
+  if (link === '/') return 's';
+  return link;
+};
+
+const toSongData = (song: Song): SongData => {
+  const msPerBeat = 60000 / song.bpm;
+  const lead: GuitarEvent[] = [];
+
+  for (const track of song.tracks) {
+    for (const note of track.notes) {
+      const stringIndex = Math.max(0, Math.min(5, track.string - 1));
+      const midiNote = DEFAULT_TUNING[stringIndex] + note.fret;
+      lead.push({
+        t: Math.round(note.beat * msPerBeat),
+        d: Math.max(1, Math.round(note.len * msPerBeat)),
+        s: stringIndex,
+        f: note.fret,
+        hz: midiToHz(midiNote),
+        acc: mapLinkToAccent(note.linkNext),
+      });
+    }
+  }
+
+  lead.sort((a, b) => a.t - b.t);
+
+  let durationMs = 0;
+  for (const event of lead) {
+    durationMs = Math.max(durationMs, event.t + event.d);
+  }
+
+  return {
+    metadata: {
+      id: song.id,
+      title: song.name,
+      artist: 'Traditional',
+      bpm: song.bpm,
+      beatsPerBar: song.beatsPerBar,
+      difficulty: 3,
+      durationMs,
+      tuning: [...DEFAULT_TUNING],
+    },
+    timing: {
+      msPerBeat,
+      pixelsPerBeat: 80,
+    },
+    tracks: {
+      lead,
+    },
+  };
+};
 
 /**
  * Default songs that come bundled with the app
  */
-export const DEFAULT_SONGS: Song[] = [
+const LEGACY_DEFAULT_SONGS: Song[] = [
   {
     id: 'default-twinkle-twinkle',
     name: 'Twinkle Twinkle Little Star',
@@ -193,4 +251,96 @@ export const DEFAULT_SONGS: Song[] = [
       },
     ],
   },
+];
+
+const CUSTOM_DEFAULT_SONGS: SongData[] = [
+  {
+    metadata: {
+      id: 'line-without-a-hook',
+      title: 'Line without a hook',
+      artist: 'Unknown',
+      bpm: 120,
+      beatsPerBar: 4,
+      difficulty: 3,
+      durationMs: 16000,
+      tuning: [64, 59, 55, 50, 45, 40],
+    },
+    timing: {
+      msPerBeat: 500,
+      pixelsPerBeat: 100,
+    },
+    tracks: {
+      lead: [
+        { t: 0, d: 200, s: 2, f: 8, hz: 311.13, v: 0.8 },
+        { t: 250, d: 200, s: 2, f: 6, hz: 277.18, v: 0.8 },
+        { t: 500, d: 200, s: 1, f: 5, hz: 329.63, v: 0.8 },
+        { t: 750, d: 200, s: 2, f: 8, hz: 311.13, v: 0.8 },
+        { t: 1000, d: 200, s: 1, f: 5, hz: 329.63, v: 0.8 },
+        { t: 1250, d: 200, s: 1, f: 5, hz: 329.63, v: 0.8 },
+        { t: 1500, d: 200, s: 2, f: 8, hz: 311.13, v: 0.8 },
+        { t: 1750, d: 200, s: 2, f: 6, hz: 277.18, v: 0.8 },
+        { t: 2000, d: 200, s: 2, f: 8, hz: 311.13, v: 0.8 },
+        { t: 2250, d: 200, s: 2, f: 5, hz: 261.63, v: 0.8 },
+        { t: 2500, d: 200, s: 2, f: 6, hz: 277.18, v: 0.8 },
+        { t: 2750, d: 200, s: 2, f: 5, hz: 261.63, v: 0.8 },
+        { t: 3000, d: 200, s: 1, f: 6, hz: 349.23, v: 0.8 },
+        { t: 3250, d: 200, s: 1, f: 5, hz: 329.63, v: 0.8 },
+        { t: 3500, d: 200, s: 3, f: 8, hz: 233.08, v: 0.8 },
+        { t: 3750, d: 200, s: 2, f: 6, hz: 277.18, v: 0.8 },
+        { t: 4000, d: 200, s: 1, f: 8, hz: 392.0, v: 0.8 },
+        { t: 4250, d: 200, s: 1, f: 5, hz: 329.63, v: 0.8 },
+        { t: 4500, d: 200, s: 1, f: 5, hz: 329.63, v: 0.8 },
+        { t: 4750, d: 200, s: 1, f: 8, hz: 392.0, v: 0.8 },
+        { t: 5000, d: 200, s: 1, f: 6, hz: 349.23, v: 0.8 },
+        { t: 5250, d: 200, s: 1, f: 5, hz: 329.63, v: 0.8 },
+        { t: 5500, d: 200, s: 3, f: 8, hz: 233.08, v: 0.8 },
+        { t: 5750, d: 200, s: 3, f: 6, hz: 207.65, v: 0.8 },
+        { t: 6000, d: 200, s: 3, f: 8, hz: 233.08, v: 0.8 },
+        { t: 6250, d: 200, s: 1, f: 6, hz: 349.23, v: 0.8 },
+        { t: 6500, d: 200, s: 3, f: 6, hz: 207.65, v: 0.8 },
+        { t: 6750, d: 200, s: 3, f: 8, hz: 233.08, v: 0.8 },
+        { t: 7000, d: 200, s: 3, f: 8, hz: 233.08, v: 0.8 },
+        { t: 7250, d: 200, s: 3, f: 8, hz: 233.08, v: 0.8 },
+        { t: 7500, d: 200, s: 1, f: 5, hz: 329.63, v: 0.8 },
+        { t: 7750, d: 200, s: 1, f: 6, hz: 349.23, v: 0.8 },
+        { t: 8000, d: 200, s: 1, f: 5, hz: 329.63, v: 0.8 },
+        { t: 8250, d: 200, s: 1, f: 6, hz: 349.23, v: 0.8 },
+        { t: 8500, d: 200, s: 1, f: 5, hz: 329.63, v: 0.8 },
+        { t: 8750, d: 200, s: 1, f: 5, hz: 329.63, v: 0.8 },
+        { t: 9000, d: 200, s: 1, f: 6, hz: 349.23, v: 0.8 },
+        { t: 9250, d: 200, s: 1, f: 5, hz: 329.63, v: 0.8 },
+        { t: 9500, d: 200, s: 1, f: 6, hz: 349.23, v: 0.8 },
+        { t: 9750, d: 200, s: 1, f: 5, hz: 329.63, v: 0.8 },
+        { t: 10000, d: 200, s: 1, f: 6, hz: 349.23, v: 0.8 },
+        { t: 10250, d: 200, s: 1, f: 5, hz: 329.63, v: 0.8 },
+        { t: 10500, d: 200, s: 1, f: 6, hz: 349.23, v: 0.8 },
+        { t: 10750, d: 200, s: 1, f: 5, hz: 329.63, v: 0.8 },
+        { t: 11000, d: 200, s: 1, f: 5, hz: 329.63, v: 0.8 },
+        { t: 11250, d: 200, s: 1, f: 6, hz: 349.23, v: 0.8 },
+        { t: 11500, d: 200, s: 1, f: 6, hz: 349.23, v: 0.8 },
+        { t: 11750, d: 200, s: 2, f: 8, hz: 311.13, v: 0.8 },
+        { t: 12000, d: 200, s: 1, f: 6, hz: 349.23, v: 0.8 },
+        { t: 12250, d: 200, s: 1, f: 6, hz: 349.23, v: 0.8 },
+        { t: 12500, d: 200, s: 1, f: 5, hz: 329.63, v: 0.8 },
+        { t: 12750, d: 200, s: 1, f: 6, hz: 349.23, v: 0.8 },
+        { t: 13000, d: 200, s: 1, f: 8, hz: 392.0, v: 0.8 },
+        { t: 13250, d: 200, s: 2, f: 8, hz: 311.13, v: 0.8 },
+        { t: 13500, d: 200, s: 2, f: 8, hz: 311.13, v: 0.8 },
+        { t: 13750, d: 200, s: 2, f: 8, hz: 311.13, v: 0.8 },
+        { t: 14000, d: 200, s: 1, f: 5, hz: 329.63, v: 0.8 },
+        { t: 14250, d: 200, s: 1, f: 6, hz: 349.23, v: 0.8 },
+        { t: 14500, d: 200, s: 1, f: 8, hz: 392.0, v: 0.8 },
+        { t: 14750, d: 200, s: 1, f: 8, hz: 392.0, v: 0.8 },
+        { t: 15000, d: 200, s: 1, f: 8, hz: 392.0, v: 0.8 },
+        { t: 15250, d: 200, s: 2, f: 6, hz: 277.18, v: 0.8 },
+        { t: 15500, d: 200, s: 1, f: 6, hz: 349.23, v: 0.8 },
+        { t: 15750, d: 200, s: 1, f: 5, hz: 329.63, v: 0.8 },
+      ],
+    },
+  },
+];
+
+export const DEFAULT_SONGS: SongData[] = [
+  ...LEGACY_DEFAULT_SONGS.map(toSongData),
+  ...CUSTOM_DEFAULT_SONGS,
 ];
